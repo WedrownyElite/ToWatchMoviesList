@@ -1,4 +1,4 @@
-- Krzysztof Sliwinski | WedrownyElite -
++ Krzysztof Sliwinski | WedrownyElite +
 
 This program is not perfect, and has a lot of querks, but it works! Lol
 Everyone is free to use it and add onto it if need be. 
