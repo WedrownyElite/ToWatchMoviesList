@@ -25,7 +25,6 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QFont, QPixmap, QColor
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint
 import requests
-from textblob import TextBlob
 import re
 import sys
 import os
@@ -33,64 +32,150 @@ import json
 import openai
 import asyncio
 import aiohttp
-from aiohttp import ClientSession
+import configparser
 from cryptography.fernet import Fernet
-import base64
-import threading
 from queue import Queue
 from urllib.parse import quote
 from functools import lru_cache
 from difflib import SequenceMatcher
 
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".MoviesList")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
+API_KEY_FILE = os.path.join(CONFIG_DIR, "api_keys.secure")
+
 omdb_key = None
 openai_key = None
-API_KEY_FILE = "WatchMoviesList/saved_data/api_keys.secure"
 ENCRYPTION_KEY = b'PWnhKse5V-Vzrfv2gVZVyKgoP5490MNjDL9lds2J4jY='
 
 API_KEY_DIR = os.path.dirname(API_KEY_FILE) or "."
 if not os.path.exists(API_KEY_DIR):
     os.makedirs(API_KEY_DIR)
 
-def ensure_api_keys():
+def ensure_config():
+    """Ensure the .MoviesList directory, config file, and saved data directory exist."""
+    if not os.path.exists(CONFIG_DIR):
+        os.makedirs(CONFIG_DIR)
+        print(f"[DEBUG] Created configuration directory: {CONFIG_DIR}")
+
+    config = configparser.ConfigParser()
+
+    if not os.path.exists(CONFIG_FILE):
+        print("[DEBUG] Config file not found. Creating new config file.")
+
+        # Generate a new encryption key and save it in the config file
+        encryption_key = Fernet.generate_key().decode()
+        config['Settings'] = {
+            'saved_data_dir': '', 
+            'encryption_key': encryption_key
+        }
+        with open(CONFIG_FILE, 'w') as configfile:
+            config.write(configfile)
+        print(f"[DEBUG] Created config file with encryption key: {CONFIG_FILE}")
+    else:
+        config.read(CONFIG_FILE)
+
+    # Verify settings in the config file
+    if 'Settings' not in config or 'saved_data_dir' not in config['Settings'] or 'encryption_key' not in config['Settings']:
+        raise RuntimeError("Invalid or missing configuration settings in config.ini")
+
+    encryption_key = config['Settings']['encryption_key']
+    saved_data_path = config['Settings']['saved_data_dir']
+
+    # Prompt the user if the saved data directory is missing or doesn't exist
+    if not saved_data_path or not os.path.exists(saved_data_path):
+        print("[DEBUG] Saved data directory missing or invalid. Prompting user for a directory.")
+        
+        msg_box = QMessageBox()
+        msg_box.setWindowTitle("Saved Data Directory")
+        msg_box.setText("The saved data directory is missing or invalid. Please select or create a directory.")
+        msg_box.setIcon(QMessageBox.Question)
+
+        # Add buttons for user options
+        open_button = msg_box.addButton("Open Existing Directory", QMessageBox.AcceptRole)
+        create_button = msg_box.addButton("Create New Directory", QMessageBox.AcceptRole)
+        cancel_button = msg_box.addButton(QMessageBox.Cancel)
+
+        # Show the dialog and handle the user's choice
+        msg_box.exec_()
+
+        if msg_box.clickedButton() == open_button:
+            dir_dialog = QFileDialog()
+            dir_path = dir_dialog.getExistingDirectory(None, "Select Existing Directory for MoviesList")
+            if not dir_path:
+                QMessageBox.critical(None, "Configuration Error", "You must select a directory to proceed.")
+                sys.exit(1)
+            saved_data_path = dir_path
+
+        elif msg_box.clickedButton() == create_button:
+            dir_dialog = QFileDialog()
+            dir_path = dir_dialog.getExistingDirectory(None, "Select Parent Directory for New MoviesList")
+            if not dir_path:
+                QMessageBox.critical(None, "Configuration Error", "You must select a directory to proceed.")
+                sys.exit(1)
+
+            # Create the MoviesList directory
+            saved_data_path = os.path.join(dir_path, "MoviesList")
+            os.makedirs(saved_data_path, exist_ok=True)
+
+        else:
+            QMessageBox.critical(None, "Configuration Error", "Operation canceled by the user. Exiting.")
+            sys.exit(1)
+
+        # Update and save the config file
+        config['Settings']['saved_data_dir'] = saved_data_path
+        with open(CONFIG_FILE, 'w') as configfile:
+            config.write(configfile)
+        print(f"[DEBUG] Updated config file with saved_data_dir: {saved_data_path}")
+
+    # Ensure the directory exists
+    if not os.path.exists(saved_data_path):
+        os.makedirs(saved_data_path)
+        print(f"[DEBUG] Created missing saved_data directory: {saved_data_path}")
+
+    return saved_data_path, encryption_key
+
+def ensure_api_keys(encryption_key):
     """Ensure API keys are available, prompting the user if necessary."""
     omdb_key, openai_key = None, None
-    try:
-        omdb_key, openai_key = load_api_keys()
-    except Exception as e:
-        print(f"[ERROR] Failed to load API keys: {e}")
+
+    if os.path.exists(API_KEY_FILE):
+        try:
+            # Load and decrypt the API keys
+            with open(API_KEY_FILE, "rb") as file:
+                lines = file.readlines()
+            omdb_key = decrypt_data(lines[0].strip(), encryption_key.encode())
+            openai_key = decrypt_data(lines[1].strip(), encryption_key.encode())
+            print(f"[DEBUG] Decrypted API keys successfully.")
+        except Exception as e:
+            print(f"[ERROR] Failed to decrypt API keys: {e}")
 
     if not (omdb_key and openai_key):
         QMessageBox.warning(None, "API Keys Missing", "API keys not found. Please provide them.")
 
     while not omdb_key or not validate_api_key_omdb(omdb_key):
-        try:
-            omdb_key, ok = QInputDialog.getText(None, "OMDB API Key", "Enter your OMDB API Key:")
-            if not ok or not omdb_key:
-                QMessageBox.critical(None, "API Key Error", "OMDB API Key is required to run the application.")
-                sys.exit(1)
-            if not validate_api_key_omdb(omdb_key):
-                QMessageBox.warning(None, "Invalid Key", "OMDB API Key is invalid.")
-        except Exception as e:
-            print(f"[ERROR] Exception during OMDB API Key input: {e}")
+        omdb_key, ok = QInputDialog.getText(None, "OMDB API Key", "Enter your OMDB API Key:")
+        if not ok or not omdb_key:
+            QMessageBox.critical(None, "API Key Error", "OMDB API Key is required to run the application.")
             sys.exit(1)
+        if not validate_api_key_omdb(omdb_key):
+            QMessageBox.warning(None, "Invalid Key", "OMDB API Key is invalid.")
 
     while not openai_key or not validate_api_key_openai(openai_key):
-        try:
-            openai_key, ok = QInputDialog.getText(None, "OpenAI API Key", "Enter your OpenAI API Key:")
-            if not ok or not openai_key:
-                QMessageBox.critical(None, "API Key Error", "OpenAI API Key is required to run the application.")
-                sys.exit(1)
-            if not validate_api_key_openai(openai_key):
-                QMessageBox.warning(None, "Invalid Key", "OpenAI API Key is invalid.")
-        except Exception as e:
-            print(f"[ERROR] Exception during OpenAI API Key input: {e}")
+        openai_key, ok = QInputDialog.getText(None, "OpenAI API Key", "Enter your OpenAI API Key:")
+        if not ok or not openai_key:
+            QMessageBox.critical(None, "API Key Error", "OpenAI API Key is required to run the application.")
             sys.exit(1)
+        if not validate_api_key_openai(openai_key):
+            QMessageBox.warning(None, "Invalid Key", "OpenAI API Key is invalid.")
 
+    # Encrypt and save API keys if they are newly provided
     try:
-        save_api_keys(omdb_key, openai_key)
+        with open(API_KEY_FILE, "wb") as file:
+            file.write(encrypt_data(omdb_key, encryption_key.encode()) + b"\n")
+            file.write(encrypt_data(openai_key, encryption_key.encode()) + b"\n")
+        print(f"[DEBUG] Encrypted and saved API keys successfully.")
     except Exception as e:
-        print(f"[ERROR] Failed to save API keys: {e}")
-        QMessageBox.critical(None, "Save Error", "Failed to save API keys. Please try again.")
+        print(f"[ERROR] Failed to save encrypted API keys: {e}")
         sys.exit(1)
 
     return omdb_key, openai_key
@@ -103,23 +188,33 @@ def decrypt_data(data, key):
     fernet = Fernet(key)
     return fernet.decrypt(data).decode()
 
-def save_api_keys(omdb_key, openai_key):
-    encrypted_omdb_key = encrypt_data(omdb_key, ENCRYPTION_KEY)
-    encrypted_openai_key = encrypt_data(openai_key, ENCRYPTION_KEY)
-    with open(API_KEY_FILE, "wb") as f:
-        f.write(encrypted_omdb_key + b"\n" + encrypted_openai_key)
-    print("[DEBUG] Keys saved successfully.")
+def save_api_keys(omdb_key, openai_key, api_key_file, encryption_key):
+    """Save API keys securely to the specified file."""
+    try:
+        encrypted_omdb_key = encrypt_data(omdb_key, encryption_key.encode())
+        encrypted_openai_key = encrypt_data(openai_key, encryption_key.encode())
+        with open(api_key_file, "wb") as f:
+            f.write(encrypted_omdb_key + b"\n" + encrypted_openai_key)
+        print(f"[DEBUG] API keys saved successfully to {api_key_file}.")
+    except Exception as e:
+        print(f"[ERROR] Failed to save API keys: {e}")
+        raise
 
-def load_api_keys():
-    if not os.path.exists(API_KEY_FILE):
-        print("[DEBUG] Key file does not exist.")
+def load_api_keys(api_key_file, encryption_key):
+    """Load API keys securely from the specified file."""
+    if not os.path.exists(api_key_file):
+        print(f"[DEBUG] API key file does not exist at: {api_key_file}")
         return None, None
-    with open(API_KEY_FILE, "rb") as f:
-        lines = f.readlines()
-    omdb_key = decrypt_data(lines[0].strip(), ENCRYPTION_KEY)
-    openai_key = decrypt_data(lines[1].strip(), ENCRYPTION_KEY)
-    print(f"[DEBUG] Keys loaded: OMDB={omdb_key}, OpenAI={openai_key}")
-    return omdb_key, openai_key
+    try:
+        with open(api_key_file, "rb") as f:
+            lines = f.readlines()
+        omdb_key = decrypt_data(lines[0].strip(), encryption_key.encode())
+        openai_key = decrypt_data(lines[1].strip(), encryption_key.encode())
+        print("[DEBUG] API keys loaded successfully.")
+        return omdb_key, openai_key
+    except Exception as e:
+        print(f"[ERROR] Failed to load API keys: {e}")
+        return None, None
 
 def validate_api_key_omdb(api_key):
     try:
@@ -314,7 +409,7 @@ class DataLoadingThread(QThread):
                 "cast": data.get("cast", "N/A"),
                 "list": data.get("list", "To Watch List"),
             }
-            self.msleep(50)  # Simulate a small delay for incremental loading
+            self.msleep(50)
             self.dataLoaded.emit(movie_data)  # Signal UI to add data
 
 class ImportMoviesThread(QThread):
@@ -538,8 +633,7 @@ class FetchSuggestionsThread(QThread):
                 })
 
             # Call GPT API for additional suggestions
-            gpt_suggestions = await query_llm_for_movie(self.text)  # Fix: Pass only the query text
-
+            gpt_suggestions = await query_llm_for_movie(self.text)
             if not gpt_suggestions:
                 print("[DEBUG] No GPT suggestions returned.")
                 return
@@ -663,8 +757,6 @@ class FilterMoviesThread(QThread):
         self._is_running = False
 
 class MovieApp(QWidget):
-    SAVE_DIR = "WatchMoviesList/saved_data"  # Directory for saved data
-    SAVE_FILE = "saved_movies.json"  # JSON file for saving movie data
 
     def __init__(self):
         super().__init__()
@@ -687,7 +779,6 @@ class MovieApp(QWidget):
         # Set the background color of the entire window
         self.setStyleSheet("background-color: #1C1C1C;")
 
-        # Define column weights for dynamic resizing
         self.column_weights = [0.3, 0.1, 0.4, 0.2]
 
         # Main layout
@@ -719,6 +810,26 @@ class MovieApp(QWidget):
             }
         """)
         self.revalidate_button.clicked.connect(self.open_revalidate_dialog)
+
+        # Add the "Move Data Directory" button
+        self.move_data_dir_button = QPushButton("Move Data Directory")
+        self.move_data_dir_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        self.move_data_dir_button.clicked.connect(self.move_data_directory)
+        self.top_layout.addWidget(self.move_data_dir_button)
         
         self.top_layout.addWidget(self.revalidate_button)
 
@@ -740,6 +851,145 @@ class MovieApp(QWidget):
 
         # Listen for application-wide focus changes
         QApplication.instance().focusChanged.connect(self.on_focus_changed)
+
+    def move_data_directory(self):
+        """Allow the user to move the saved_data directory to a new location."""
+        print("[DEBUG] User initiated move of the saved_data directory.")
+        
+        # Create a custom dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Move Save Directory")
+        dialog.setStyleSheet("background-color: #1C1C1C; color: white;")
+        layout = QVBoxLayout(dialog)
+
+        # Add instructions
+        instructions = QLabel(
+            "Would you like to open an existing save directory or create a new one?"
+        )
+        instructions.setWordWrap(True)
+        instructions.setAlignment(Qt.AlignCenter)  # Center align the text
+        instructions.setStyleSheet("color: white; font-size: 14px;")
+        layout.addWidget(instructions)
+
+        # Add buttons for choices
+        open_button = QPushButton("Open Existing Directory")
+        open_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        layout.addWidget(open_button)
+
+        create_button = QPushButton("Create New Directory")
+        create_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        layout.addWidget(create_button)
+
+        # Cancel button
+        cancel_button = QPushButton("Cancel")
+        cancel_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        layout.addWidget(cancel_button)
+
+        def handle_open():
+            dir_dialog = QFileDialog()
+            dir_path = dir_dialog.getExistingDirectory(dialog, "Select Existing Directory for MoviesList")
+            if dir_path:
+                self.move_to_selected_directory(dir_path)
+                dialog.accept()
+            else:
+                QMessageBox.warning(dialog, "Invalid Directory", "You must select a directory.")
+
+        def handle_create():
+            dir_dialog = QFileDialog()
+            dir_path = dir_dialog.getExistingDirectory(dialog, "Select Parent Directory for New MoviesList")
+            if dir_path:
+                new_movies_list_path = os.path.join(dir_path, "MoviesList")
+                os.makedirs(new_movies_list_path, exist_ok=True)
+                self.move_to_selected_directory(new_movies_list_path)
+                dialog.accept()
+            else:
+                QMessageBox.warning(dialog, "Invalid Directory", "You must select a directory.")
+
+        def handle_cancel():
+            dialog.reject()
+
+        open_button.clicked.connect(handle_open)
+        create_button.clicked.connect(handle_create)
+        cancel_button.clicked.connect(handle_cancel)
+
+        dialog.exec_()
+
+    def move_to_selected_directory(self, new_dir_path):
+        """Move the save data to the selected directory."""
+        try:
+            old_dir_path = MovieApp.SAVE_DIR
+
+            # Move files to the new directory
+            for item in os.listdir(old_dir_path):
+                old_item_path = os.path.join(old_dir_path, item)
+                new_item_path = os.path.join(new_dir_path, item)
+                if os.path.isdir(old_item_path):
+                    os.rename(old_item_path, new_item_path)
+                else:
+                    os.replace(old_item_path, new_item_path)
+
+            print(f"[DEBUG] Data moved successfully from {old_dir_path} to {new_dir_path}.")
+
+            # Update the config file
+            config = configparser.ConfigParser()
+            config.read(CONFIG_FILE)
+            config['Settings']['saved_data_dir'] = new_dir_path
+            with open(CONFIG_FILE, 'w') as configfile:
+                config.write(configfile)
+            print(f"[DEBUG] Updated config.ini with new directory: {new_dir_path}")
+
+            # Delete the old directory
+            os.rmdir(old_dir_path)
+            print(f"[DEBUG] Deleted old directory: {old_dir_path}")
+
+            # Update the application state
+            MovieApp.SAVE_DIR = new_dir_path
+            self.show_popup("Save directory moved successfully.", color="green")
+        except Exception as e:
+            print(f"[ERROR] Failed to move save directory: {e}")
+            QMessageBox.critical(self, "Move Failed", f"An error occurred while moving the directory:\n{e}")
 
     def query_omdb_details(self, title, year=None):
             """Query the OMDb API for movie details."""
@@ -802,9 +1052,15 @@ class MovieApp(QWidget):
 
         print(f"[DEBUG] Selected revalidation - OMDB: {omdb_revalidate}, OpenAI: {openai_revalidate}")
 
+        # Get encryption key and API key file location dynamically
+        config = configparser.ConfigParser()
+        config.read(CONFIG_FILE)
+        encryption_key = config['Settings']['encryption_key']
+        api_key_file = os.path.join(MovieApp.SAVE_DIR, "api_keys.secure")
+
         # Load existing keys in case they are not revalidated
         try:
-            current_omdb_key, current_openai_key = load_api_keys()
+            current_omdb_key, current_openai_key = load_api_keys(api_key_file, encryption_key)
         except Exception as e:
             print(f"[ERROR] Failed to load existing API keys: {e}")
             current_omdb_key, current_openai_key = None, None
@@ -853,9 +1109,9 @@ class MovieApp(QWidget):
         else:
             openai_key = current_openai_key  # Use the existing key if not revalidated
 
-        # Save the revalidated keys
+        # Save the revalidated keys dynamically to the appropriate file
         try:
-            save_api_keys(omdb_key, openai_key)
+            save_api_keys(omdb_key, openai_key, api_key_file, encryption_key)
             print("[DEBUG] API keys saved successfully.")
         except Exception as e:
             print(f"[ERROR] Failed to save API keys: {e}")
@@ -866,20 +1122,18 @@ class MovieApp(QWidget):
         print("[DEBUG] Revalidate API keys dialog closed.")
 
     def save_movies(self):
-        """Save movies to the JSON file."""
+        """Save movies to the JSON file in the user-defined directory."""
         try:
-            file_path = os.path.join(self.SAVE_DIR, self.SAVE_FILE)
+            file_path = os.path.join(self.SAVE_DIR, "movies.json")
             with open(file_path, "w") as file:
                 json.dump(self.saved_movies, file, indent=4)
             print(f"[DEBUG] Movies saved to file at: {file_path}")
         except Exception as e:
             print(f"[ERROR] Failed to save movies: {e}")
-
+    
     def download_poster(self, url, title):
-        """Download and save the poster image locally, or fetch it from saved data."""
+        """Download and save the poster image locally in the user-defined directory."""
         poster_path = os.path.join(self.SAVE_DIR, f"{title}.jpg")
-        poster_path = os.path.normpath(poster_path)  # Normalize path
-
         if os.path.exists(poster_path):
             return poster_path  # Return if already exists
 
@@ -1028,7 +1282,7 @@ class MovieApp(QWidget):
         self.suggestion_list_tab1.setStyleSheet("background-color: #1C1C1C; color: white;")
         self.suggestion_list_tab1.hide()
         self.suggestion_list_tab1.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.suggestion_list_tab1.verticalScrollBar().setSingleStep(8)  # Move 1 pixel at a time
+        self.suggestion_list_tab1.verticalScrollBar().setSingleStep(8)
 
         # Connect the text entry to update suggestions
         self.text_entry_tab1.textChanged.connect(
@@ -1039,9 +1293,9 @@ class MovieApp(QWidget):
         )
 
         # Add table
-        self.table_tab1 = QTableWidget(0, 5)  # Start with 0 rows and 4 columns
+        self.table_tab1 = QTableWidget(0, 5)
         self.table_tab1.setHorizontalHeaderLabels(["Title", "Poster", "Plot", "Cast", "Rating"])
-        self.table_tab1.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)  # Columns stretch
+        self.table_tab1.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_tab1.setStyleSheet("""
             QTableWidget {
                 background-color: #1C1C1C; 
@@ -1070,7 +1324,7 @@ class MovieApp(QWidget):
         self.populate_table()
         tab1_layout.addWidget(self.table_tab1)
 
-        self.table_tab1.verticalScrollBar().setSingleStep(1)  # Set the scroll step to 1 pixel
+        self.table_tab1.verticalScrollBar().setSingleStep(1)
 
         # Connect right-click to context menu
         self.table_tab1.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1090,14 +1344,14 @@ class MovieApp(QWidget):
         self.tab2.setLayout(tab2_layout)
 
         # Set margins for the layout to add padding around the table
-        tab2_layout.setContentsMargins(10, 10, 10, 10)  # Left, Top, Right, Bottom
+        tab2_layout.setContentsMargins(10, 10, 10, 10)
 
         # Add a title label for the tab
         self.tab2_title = QLabel("Watched List")
-        self.tab2_title.setFont(QFont("Arial", 16, QFont.Bold))  # Set font and size
-        self.tab2_title.setAlignment(Qt.AlignCenter)  # Center align the title
-        self.tab2_title.setStyleSheet("color: white;")  # Set text color to white
-        tab2_layout.addWidget(self.tab2_title)  # Add the title to the layout
+        self.tab2_title.setFont(QFont("Arial", 16, QFont.Bold))
+        self.tab2_title.setAlignment(Qt.AlignCenter)
+        self.tab2_title.setStyleSheet("color: white;")
+        tab2_layout.addWidget(self.tab2_title)
 
         # Import button container
         import_button_tab2_container = QWidget()
@@ -1133,7 +1387,7 @@ class MovieApp(QWidget):
         # Add a container widget for the text entry
         text_entry_container = QWidget()
         text_entry_layout = QVBoxLayout()
-        text_entry_layout.setAlignment(Qt.AlignHCenter)  # Center the text entry horizontally
+        text_entry_layout.setAlignment(Qt.AlignHCenter)
         text_entry_container.setLayout(text_entry_layout)
         tab2_layout.addWidget(text_entry_container)
 
@@ -1145,8 +1399,8 @@ class MovieApp(QWidget):
         self.text_entry_tab2.setStyleSheet("background-color: #1C1C1C; color: white;")
         
         # Set minimum and maximum width
-        self.text_entry_tab2.setMinimumWidth(300)  # Minimum width
-        self.text_entry_tab2.setMaximumWidth(500)  # Maximum width
+        self.text_entry_tab2.setMinimumWidth(300)
+        self.text_entry_tab2.setMaximumWidth(500)
 
         # Add the text entry to the centered layout
         text_entry_layout.addWidget(self.text_entry_tab2)
@@ -1159,7 +1413,7 @@ class MovieApp(QWidget):
         self.filter_entry_tab2.setStyleSheet("background-color: #2C2C2C; color: white;")
         text_entry_container = QWidget()
         filter_entry_tab2_layout = QVBoxLayout()
-        filter_entry_tab2_layout.setAlignment(Qt.AlignHCenter)  # Center the text entry horizontally
+        filter_entry_tab2_layout.setAlignment(Qt.AlignHCenter)
         text_entry_container.setLayout(filter_entry_tab2_layout)
         tab2_layout.addWidget(text_entry_container)
         
@@ -1170,8 +1424,8 @@ class MovieApp(QWidget):
             lambda text: self.filter_table_rows(self.table_tab2, text)
         )
 
-        self.filter_entry_tab2.setMinimumWidth(300)  # Minimum width
-        self.filter_entry_tab2.setMaximumWidth(500)  # Maximum width 
+        self.filter_entry_tab2.setMinimumWidth(300)
+        self.filter_entry_tab2.setMaximumWidth(500)
 
         # Add a horizontal container for the counter and filter entry
         filter_container = QWidget()
@@ -1192,7 +1446,7 @@ class MovieApp(QWidget):
         self.suggestion_list_tab2.setStyleSheet("background-color: #1C1C1C; color: white;")
         self.suggestion_list_tab2.hide()
         self.suggestion_list_tab2.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
-        self.suggestion_list_tab2.verticalScrollBar().setSingleStep(8)  # Move 1 pixel at a time
+        self.suggestion_list_tab2.verticalScrollBar().setSingleStep(8)
 
 
         # Connect the text entry to update suggestions
@@ -1204,9 +1458,9 @@ class MovieApp(QWidget):
         )
 
         # Add table
-        self.table_tab2 = QTableWidget(0, 5)  # Start with 0 rows and 4 columns
+        self.table_tab2 = QTableWidget(0, 5)
         self.table_tab2.setHorizontalHeaderLabels(["Title", "Poster", "Plot", "Cast", "Rating"])
-        self.table_tab2.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)  # Columns stretch
+        self.table_tab2.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_tab2.setStyleSheet("""
             QTableWidget {
                 background-color: #1C1C1C; 
@@ -1228,14 +1482,14 @@ class MovieApp(QWidget):
             }
         """)
         self.table_tab2.setFont(QFont("Arial", 12))
-        self.table_tab2.verticalHeader().setVisible(False)  # Hide row numbers
+        self.table_tab2.verticalHeader().setVisible(False)
         self.table_tab2.horizontalHeader().sectionClicked.connect(
         lambda col: self.sort_table(self.table_tab2, col)
         )
         self.populate_table()
         tab2_layout.addWidget(self.table_tab2)
 
-        self.table_tab2.verticalScrollBar().setSingleStep(1)  # Set the scroll step to 1 pixel
+        self.table_tab2.verticalScrollBar().setSingleStep(1)
 
         # Connect right-click to context menu
         self.table_tab2.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1252,7 +1506,7 @@ class MovieApp(QWidget):
     def _load_and_populate_data_in_thread(self):
         """Load and populate data incrementally in a background thread."""
         self.is_busy = True  # Disable interactions
-        self.disable_user_interaction()  # Disable UI elements
+        self.disable_user_interaction()
         self.saved_movies = self.load_saved_movies()
 
         self.loading_thread = DataLoadingThread(self.saved_movies)
@@ -1268,7 +1522,7 @@ class MovieApp(QWidget):
     def on_data_loaded(self):
         """Handle the end of the data loading process."""
         self.is_busy = False  # Re-enable interactions
-        self.enable_user_interaction()  # Re-enable UI elements
+        self.enable_user_interaction()
         self.show_popup("Data loading complete. You can now move or delete titles.", color="green")
 
         # Update tab names with the current counts
@@ -1285,9 +1539,9 @@ class MovieApp(QWidget):
         self.table_tab2.setEnabled(False)
     
     def load_saved_movies(self):
-        """Load saved movies from the JSON file."""
+        """Load saved movies from the JSON file in the user-defined directory."""
         try:
-            file_path = os.path.join(self.SAVE_DIR, self.SAVE_FILE)
+            file_path = os.path.join(self.SAVE_DIR, "movies.json")
             print(f"[DEBUG] Attempting to load movies from: {file_path}")
             if os.path.exists(file_path):
                 with open(file_path, "r") as file:
@@ -1303,7 +1557,7 @@ class MovieApp(QWidget):
         except Exception as e:
             print(f"[ERROR] Failed to load saved movies: {e}")
             return {}
-
+    
     def enable_user_interaction(self):
         """Re-enable search, filter, and table interactions."""
         self.text_entry_tab1.setEnabled(True)
@@ -1419,8 +1673,8 @@ class MovieApp(QWidget):
 
     def start_import_thread(self, movie_titles, target_table):
         """Start a threaded movie import with a concurrent queue."""
-        self.is_busy = True  # Disable interactions
-        self.queue = Queue()  # Create a thread-safe queue
+        self.is_busy = True
+        self.queue = Queue()
         for title in movie_titles:
             self.queue.put(title)
 
@@ -1434,7 +1688,7 @@ class MovieApp(QWidget):
 
     def on_import_finished(self):
         """Handle the end of the import process."""
-        self.is_busy = False  # Re-enable interactions
+        self.is_busy = False
         self.show_popup("Import complete. You can now move or delete titles.", color="green")
         self.save_movies()
 
@@ -1482,7 +1736,7 @@ class MovieApp(QWidget):
     def sort_table(self, table, column):
         """Sort the table based on the clicked column with four sorting states."""
         # Define the column-specific sorting state keys
-        sort_states = table.property("sort_states") or {0: 0, 4: 0}  # Default state for Title and Rating
+        sort_states = table.property("sort_states") or {0: 0, 4: 0}
         current_state = sort_states.get(column, 0)
 
         # Get all row data and store it in a list
@@ -1492,7 +1746,7 @@ class MovieApp(QWidget):
             rating = float(table.item(row, 4).text()) if table.item(row, 4) and table.item(row, 4).text().replace('.', '', 1).isdigit() else 0.0
             cast = table.item(row, 3).text() if table.item(row, 3) else ""
             plot = table.item(row, 2).text() if table.item(row, 2) else ""
-            widget = table.cellWidget(row, 1)  # Get poster widget
+            widget = table.cellWidget(row, 1)
             pixmap = widget.pixmap() if widget and widget.pixmap() else None
 
             # Store the row data
@@ -1505,19 +1759,19 @@ class MovieApp(QWidget):
             })
 
         # Determine sorting order based on current state
-        if column == 0:  # Title column
+        if column == 0:
             if current_state == 0:
                 row_data.sort(key=lambda x: x["title"], reverse=False)  # A-Z
             elif current_state == 1:
                 row_data.sort(key=lambda x: x["title"], reverse=True)  # Z-A
-        elif column == 4:  # Rating column
+        elif column == 4:
             if current_state == 0:
                 row_data.sort(key=lambda x: x["rating"], reverse=True)  # Highest to Lowest
             elif current_state == 1:
                 row_data.sort(key=lambda x: x["rating"], reverse=False)  # Lowest to Highest
 
         # Cycle to the next state
-        sort_states[column] = (current_state + 1) % 2  # Toggle between 0 and 1 for now
+        sort_states[column] = (current_state + 1) % 2
         table.setProperty("sort_states", sort_states)  # Save the updated states
 
         # Clear and repopulate the table
@@ -1579,14 +1833,14 @@ class MovieApp(QWidget):
         for row in range(table.rowCount()):
             title = table.item(row, 0).text() if table.item(row, 0) else ""
             plot = table.item(row, 2).text() if table.item(row, 2) else ""
-            cast = table.item(row, 3).text() if table.item(row, 3) else "N/A"  # Include cast
+            cast = table.item(row, 3).text() if table.item(row, 3) else "N/A"
             rating = table.item(row, 4).text() if table.item(row, 4) else "N/A"
             poster_widget = table.cellWidget(row, 1)
             pixmap = poster_widget.pixmap() if poster_widget and poster_widget.pixmap() else None
             self.original_table_data[table].append({
                 "title": title,
                 "plot": plot,
-                "cast": cast,  # Fix: Include cast in saved data
+                "cast": cast,
                 "rating": rating,
                 "pixmap": pixmap.copy() if pixmap else None,
             })
@@ -1624,7 +1878,7 @@ class MovieApp(QWidget):
             table.setItem(row_idx, 2, plot_item)
 
             # Cast
-            cast_item = QTableWidgetItem(row_data.get("cast", "N/A"))  # Fix: Properly retrieve cast
+            cast_item = QTableWidgetItem(row_data.get("cast", "N/A"))
             cast_item.setTextAlignment(Qt.AlignCenter)
             table.setItem(row_idx, 3, cast_item)
 
@@ -1650,7 +1904,7 @@ class MovieApp(QWidget):
         table.setRowCount(0)
         for row_data in self.original_table_data[table]:
             title = row_data.get("title", "").lower()
-            cast = row_data.get("cast", "N/A").lower()  # Debug missing cast here
+            cast = row_data.get("cast", "N/A").lower()
             print(f"[DEBUG] Filtering row - Title: {title}, Cast: {cast}")
 
             if filter_text in title or filter_text in cast:
@@ -1721,7 +1975,7 @@ class MovieApp(QWidget):
     def showEvent(self, event):
         """Trigger the resizeEvent explicitly when the window is shown."""
         super().showEvent(event)
-        self.resizeEvent(None)  # Call resizeEvent explicitly
+        self.resizeEvent(None)
 
     def resizeEvent(self, event):
         """Update the suggestion list's position and size on window resize."""
@@ -1791,7 +2045,7 @@ class MovieApp(QWidget):
         for column in range(self.table.columnCount()):
             item = self.table.item(row, column)
             if item:
-                item.setBackground(QColor("#FFA500"))  # Orange color
+                item.setBackground(QColor("#FFA500"))
 
     def move_entry_to_other_tab(self, row, current_table, target_table):
         """Move a row from one table to the other and update original_table_data."""
@@ -1872,9 +2126,9 @@ class MovieApp(QWidget):
         text = text.strip()
         
         # Reset suggestions_active and handle a new query
-        self.suggestions_active = True  # Ensure suggestions fetching is re-enabled
+        self.suggestions_active = True
 
-        if len(text) >= 3:  # Only proceed if the input is sufficiently long
+        if len(text) >= 1: # Literally not needed, but I'm lazy :)
             # Cancel ongoing suggestion thread
             if self.suggestion_thread and self.suggestion_thread.isRunning():
                 self.suggestion_thread.stop()
@@ -1884,7 +2138,7 @@ class MovieApp(QWidget):
             # Start a timer to fetch suggestions after user stops typing
             self.timer_tab1.timeout.disconnect()  # Disconnect any previous connections
             self.timer_tab1.timeout.connect(lambda: self.fetch_suggestions(text_entry, suggestion_list))
-            self.timer_tab1.start(500)  # Start 500ms delay after typing
+            self.timer_tab1.start(800)  # Start 800ms delay after typing
         else:
             # Hide the suggestion list if input is too short
             suggestion_list.hide()
@@ -1954,7 +2208,7 @@ class MovieApp(QWidget):
         suggestion_list.clear()
 
         # Respect GPT's order directly
-        self.current_suggestions = suggestions[:8]  # Limit to the top 8 suggestions from GPT
+        self.current_suggestions = suggestions[:8]
 
         # Debugging: Show the raw order from GPT
         print(f"[DEBUG] GPT-sorted suggestions: {[s['title'] for s in self.current_suggestions]}")
@@ -1965,7 +2219,7 @@ class MovieApp(QWidget):
 
         # Ensure the suggestion list is properly displayed
         print(f"[DEBUG] Suggestion list height before setting: {suggestion_list.height()}")
-        suggestion_list.setFixedHeight(800)  # Adjust height if needed
+        suggestion_list.setFixedHeight(800)
         print(f"[DEBUG] Suggestion list height after setting: {suggestion_list.height()}")
         self.position_suggestion_list(text_entry, suggestion_list)
         suggestion_list.show()
@@ -2156,7 +2410,7 @@ class MovieApp(QWidget):
 
         # Stop all image threads
         for thread in self.image_threads:
-            thread.terminate()  # Terminate safely if running
+            thread.terminate()
         self.image_threads.clear()
 
         event.accept()
@@ -2257,7 +2511,7 @@ class MovieApp(QWidget):
         self.saved_movies[title] = {
             "plot": plot if plot else "N/A",
             "rating": rating if rating else "N/A",
-            "cast": cast if cast else "N/A",  # Ensure cast is stored
+            "cast": cast if cast else "N/A",
             "poster_path": poster_path,
             "list": "To Watch List" if target_table == self.table_tab1 else "Watched List",
         }
@@ -2383,11 +2637,11 @@ class MovieApp(QWidget):
             }}
         """)
         popup.setAlignment(Qt.AlignCenter)
-        popup.setGeometry(10, 10, self.width() - 20, 40)  # Position at the top of the window
+        popup.setGeometry(10, 10, self.width() - 20, 40)
         popup.show()
 
-        # Hide the popup after 2 seconds
-        QTimer.singleShot(2000, popup.deleteLater)
+        # Hide the popup after 3 seconds
+        QTimer.singleShot(3000, popup.deleteLater)
             
     def get_top_actors(self, title, year):
         """Fetch the top 5 actors/actresses for the given title and year."""
@@ -2410,13 +2664,17 @@ class MovieApp(QWidget):
         self.update_suggestions(suggestions, suggestion_list, text_entry)
 
 def main():
-    global omdb_key, openai_key  # Declare as global to modify them
-    app = QApplication(sys.argv)  # Initialize QApplication first
+    global omdb_key, openai_key
+    app = QApplication(sys.argv)
     try:
+        saved_data_dir, encryption_key = ensure_config()
+        print(f"[DEBUG] Using saved_data directory: {saved_data_dir}")
+
+        # Update global variables for saved data paths
+        MovieApp.SAVE_DIR = saved_data_dir
+
         # Ensure API keys are loaded
-        omdb_key, openai_key = ensure_api_keys()
-        print("OMDB Key:", omdb_key)
-        print("OpenAI Key:", openai_key)
+        omdb_key, openai_key = ensure_api_keys(encryption_key)
 
         # Initialize and show the main application window
         window = MovieApp()

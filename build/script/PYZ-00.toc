@@ -1,0 +1,2 @@
+('C:\\CodingC++\\Python\\GitHubRepos\\ToWatchMoviesList\\build\\script\\PYZ-00.pyz',
+ [])
