@@ -14,3 +14,6 @@ You can also revalidate either OMDb or GPT API key if you ever need to by using 
 You can right click entries within a table to delete the entry or easily move the entry to the other table.
 
 This is my first actual python project that revolves around API querying.
+
+12/22/2024 - Use of the GPT API is now optional but the suggestion box will only be populated with 1 suggestion if you spell the movie you're looking for correctly. It currently does not account for release years so if you're looking for a title that has multiple releases, you will not be able to add it yet.
+OMDb API key is still required (OMDb API Keys are free, no query limits)
