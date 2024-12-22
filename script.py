@@ -144,35 +144,33 @@ def ensure_api_keys(encryption_key):
             with open(API_KEY_FILE, "rb") as file:
                 lines = file.readlines()
             omdb_key = decrypt_data(lines[0].strip(), encryption_key.encode())
-            openai_key = decrypt_data(lines[1].strip(), encryption_key.encode())
+            openai_key = decrypt_data(lines[1].strip(), encryption_key.encode()) if len(lines) > 1 else None
             print(f"[DEBUG] Decrypted API keys successfully.")
         except Exception as e:
             print(f"[ERROR] Failed to decrypt API keys: {e}")
 
-    if not (omdb_key and openai_key):
-        QMessageBox.warning(None, "API Keys Missing", "API keys not found. Please provide them.")
-
+    # Validate OMDb API Key
     while not omdb_key or not validate_api_key_omdb(omdb_key):
-        omdb_key, ok = QInputDialog.getText(None, "OMDB API Key", "Enter your OMDB API Key:")
+        omdb_key, ok = QInputDialog.getText(None, "OMDb API Key", "Enter your OMDb API Key:")
         if not ok or not omdb_key:
-            QMessageBox.critical(None, "API Key Error", "OMDB API Key is required to run the application.")
+            QMessageBox.critical(None, "API Key Error", "OMDb API Key is required to run the application.")
             sys.exit(1)
         if not validate_api_key_omdb(omdb_key):
-            QMessageBox.warning(None, "Invalid Key", "OMDB API Key is invalid.")
+            QMessageBox.warning(None, "Invalid Key", "OMDb API Key is invalid.")
 
-    while not openai_key or not validate_api_key_openai(openai_key):
-        openai_key, ok = QInputDialog.getText(None, "OpenAI API Key", "Enter your OpenAI API Key:")
-        if not ok or not openai_key:
-            QMessageBox.critical(None, "API Key Error", "OpenAI API Key is required to run the application.")
-            sys.exit(1)
+    # Validate OpenAI API Key (optional)
+    if openai_key:
         if not validate_api_key_openai(openai_key):
-            QMessageBox.warning(None, "Invalid Key", "OpenAI API Key is invalid.")
+            QMessageBox.warning(None, "Invalid Key", "OpenAI API Key is invalid. GPT-based suggestions will be disabled.")
+            openai_key = None
+    else:
+        QMessageBox.information(None, "Optional Key Missing", "OpenAI API Key is missing. GPT-based suggestions will be disabled.")
 
-    # Encrypt and save API keys if they are newly provided
+    # Encrypt and save API keys
     try:
         with open(API_KEY_FILE, "wb") as file:
             file.write(encrypt_data(omdb_key, encryption_key.encode()) + b"\n")
-            file.write(encrypt_data(openai_key, encryption_key.encode()) + b"\n")
+            file.write(encrypt_data(openai_key or "", encryption_key.encode()) + b"\n")
         print(f"[DEBUG] Encrypted and saved API keys successfully.")
     except Exception as e:
         print(f"[ERROR] Failed to save encrypted API keys: {e}")
@@ -578,41 +576,19 @@ class FetchSuggestionsThread(QThread):
         self._is_running = True
 
     def run(self):
+        """Run the thread and fetch suggestions."""
         if not self._is_running:
             print("[DEBUG] Thread is not running.")
             return
 
         try:
             print(f"[DEBUG] Starting FetchSuggestionsThread for text: {self.text}")
-            asyncio.run(self.fetch_and_emit_suggestions())
+            asyncio.run(self.fetch_and_emit_suggestions())  # Call the async method
         except Exception as e:
             print(f"[ERROR] Exception in FetchSuggestionsThread.run: {e}")
 
-    @staticmethod
-    async def fetch_omdb_details(title, year=None):
-        try:
-            query_url = f"http://www.omdbapi.com/?t={quote(title)}"
-            if year:
-                query_url += f"&y={year}"
-            query_url += f"&apikey={omdb_key}"
-
-            print(f"[DEBUG] Fetching OMDb details for: {query_url}")
-            async with aiohttp.ClientSession() as session:
-                async with session.get(query_url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get("Response") == "True":
-                            return data
-                        else:
-                            print(f"[DEBUG] OMDb fetch failed for '{title}': {data.get('Error', 'Unknown error')}")
-                    else:
-                        print(f"[ERROR] OMDb request failed with status {response.status} for {query_url}")
-            return None
-        except Exception as e:
-            print(f"[ERROR] fetch_omdb_details: {e}")
-            return None
-
     async def fetch_and_emit_suggestions(self):
+        """Fetch suggestions from OMDb and optionally GPT."""
         try:
             # Extract title and optional year
             match = re.match(r"(.+?)\s+(\d{4})$", self.text.strip())
@@ -631,6 +607,11 @@ class FetchSuggestionsThread(QThread):
                     "poster_url": omdb_result.get("Poster", ""),
                     "actors": omdb_result.get("Actors", "N/A"),
                 })
+
+            # Skip GPT-based suggestions if the OpenAI API key is missing
+            if not openai_key:
+                print("[DEBUG] Skipping GPT suggestions as OpenAI API key is not provided.")
+                return
 
             # Call GPT API for additional suggestions
             gpt_suggestions = await query_llm_for_movie(self.text)
@@ -664,7 +645,32 @@ class FetchSuggestionsThread(QThread):
         except Exception as e:
             print(f"[ERROR] fetch_and_emit_suggestions: {e}")
 
+    async def fetch_omdb_details(self, title, year=None):
+        """Query the OMDb API asynchronously."""
+        try:
+            query_url = f"http://www.omdbapi.com/?t={quote(title)}"
+            if year:
+                query_url += f"&y={year}"
+            query_url += f"&apikey={omdb_key}"
+
+            print(f"[DEBUG] Fetching OMDb details for: {query_url}")
+            async with aiohttp.ClientSession() as session:
+                async with session.get(query_url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("Response") == "True":
+                            return data
+                        else:
+                            print(f"[DEBUG] OMDb fetch failed for '{title}': {data.get('Error', 'Unknown error')}")
+                    else:
+                        print(f"[ERROR] OMDb request failed with status {response.status} for {query_url}")
+            return None
+        except Exception as e:
+            print(f"[ERROR] fetch_omdb_details: {e}")
+            return None
+
     def stop(self):
+        """Stop the thread."""
         self._is_running = False
 
 class ImageLoaderThread(QThread):
@@ -2207,7 +2213,6 @@ class MovieApp(QWidget):
 
         suggestion_list.clear()
 
-        # Respect GPT's order directly
         self.current_suggestions = suggestions[:8]
 
         # Debugging: Show the raw order from GPT
