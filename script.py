@@ -1062,7 +1062,7 @@ class MovieApp(QWidget):
         config = configparser.ConfigParser()
         config.read(CONFIG_FILE)
         encryption_key = config['Settings']['encryption_key']
-        api_key_file = os.path.join(MovieApp.SAVE_DIR, "api_keys.secure")
+        api_key_file = os.path.join(CONFIG_DIR, "api_keys.secure")
 
         # Load existing keys in case they are not revalidated
         try:
