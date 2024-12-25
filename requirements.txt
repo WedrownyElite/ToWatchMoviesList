@@ -1,0 +1,5 @@
+PyQt5
+requests
+openai
+aiohttp
+cryptography

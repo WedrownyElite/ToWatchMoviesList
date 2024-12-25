@@ -21,9 +21,11 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QPushButton,
     QFileDialog,
+    QGridLayout,
+    QShortcut,
 )
-from PyQt5.QtGui import QFont, QPixmap, QColor
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint
+from PyQt5.QtGui import QFont, QPixmap, QColor, QIcon, QIntValidator, QKeySequence
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QSize
 import requests
 import re
 import sys
@@ -48,8 +50,20 @@ openai_key = None
 ENCRYPTION_KEY = b'PWnhKse5V-Vzrfv2gVZVyKgoP5490MNjDL9lds2J4jY='
 
 API_KEY_DIR = os.path.dirname(API_KEY_FILE) or "."
+
+max_suggestions = 10
+
 if not os.path.exists(API_KEY_DIR):
     os.makedirs(API_KEY_DIR)
+
+def resource_path(relative_path):
+    """Get the absolute path to the resource, works for dev and PyInstaller."""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 def ensure_config():
     """Ensure the .MoviesList directory, config file, and saved data directory exist."""
@@ -65,7 +79,7 @@ def ensure_config():
         # Generate a new encryption key and save it in the config file
         encryption_key = Fernet.generate_key().decode()
         config['Settings'] = {
-            'saved_data_dir': '', 
+            'saved_data_dir': '',
             'encryption_key': encryption_key
         }
         with open(CONFIG_FILE, 'w') as configfile:
@@ -84,41 +98,73 @@ def ensure_config():
     # Prompt the user if the saved data directory is missing or doesn't exist
     if not saved_data_path or not os.path.exists(saved_data_path):
         print("[DEBUG] Saved data directory missing or invalid. Prompting user for a directory.")
-        
-        msg_box = QMessageBox()
-        msg_box.setWindowTitle("Saved Data Directory")
-        msg_box.setText("The saved data directory is missing or invalid. Please select or create a directory.")
-        msg_box.setIcon(QMessageBox.Question)
 
-        # Add buttons for user options
-        open_button = msg_box.addButton("Open Existing Directory", QMessageBox.AcceptRole)
-        create_button = msg_box.addButton("Create New Directory", QMessageBox.AcceptRole)
-        cancel_button = msg_box.addButton(QMessageBox.Cancel)
+        # Use a custom message dialog
+        prompt_dialog = CustomMessageDialog(
+            title="Saved Data Directory",
+            message="The saved data directory is missing or invalid. Please select or create a directory.",
+            button_options=[
+                {"text": "Open Existing", "role": "open_existing"},
+                {"text": "Create Directory", "role": "create_directory"},
+                {"text": "Exit", "role": "exit"}
+            ],
+            text_color="white"
+        )
 
-        # Show the dialog and handle the user's choice
-        msg_box.exec_()
+        result = [None]  # Store the result from the dialog
 
-        if msg_box.clickedButton() == open_button:
+        def handle_button(role):
+            result[0] = role
+            prompt_dialog.accept()
+
+        prompt_dialog.button_pressed.connect(handle_button)
+        prompt_dialog.exec_()
+
+        if not result[0]:  # Handle case where the user closes the dialog
+            CustomMessageDialog(
+                "Exiting",
+                "Closing Program",
+                button_options=[{"text": "Exit", "role": "exit"}],
+                text_color="red"
+            ).exec_()
+            sys.exit("[ERROR] User closed the dialog without selecting an option.")
+
+        if result[0] == "open_existing":
             dir_dialog = QFileDialog()
             dir_path = dir_dialog.getExistingDirectory(None, "Select Existing Directory for MoviesList")
             if not dir_path:
-                QMessageBox.critical(None, "Configuration Error", "You must select a directory to proceed.")
+                CustomMessageDialog(
+                    "Configuration Error",
+                    "You must select a directory to proceed.",
+                    button_options=[{"text": "Exit", "role": "exit"}],
+                    text_color="red"
+                ).exec_()
                 sys.exit(1)
             saved_data_path = dir_path
 
-        elif msg_box.clickedButton() == create_button:
+        elif result[0] == "create_directory":
             dir_dialog = QFileDialog()
             dir_path = dir_dialog.getExistingDirectory(None, "Select Parent Directory for New MoviesList")
             if not dir_path:
-                QMessageBox.critical(None, "Configuration Error", "You must select a directory to proceed.")
+                CustomMessageDialog(
+                    "Configuration Error",
+                    "You must select a directory to proceed.",
+                    button_options=[{"text": "Exit", "role": "exit"}],
+                    text_color="red"
+                ).exec_()
                 sys.exit(1)
 
             # Create the MoviesList directory
             saved_data_path = os.path.join(dir_path, "MoviesList")
             os.makedirs(saved_data_path, exist_ok=True)
 
-        else:
-            QMessageBox.critical(None, "Configuration Error", "Operation canceled by the user. Exiting.")
+        elif result[0] == "exit":
+            CustomMessageDialog(
+                "Exiting",
+                "Closing Program",
+                button_options=[{"text": "Exit", "role": "exit"}],
+                text_color="red"
+            ).exec_()
             sys.exit(1)
 
         # Update and save the config file
@@ -132,49 +178,105 @@ def ensure_config():
         os.makedirs(saved_data_path)
         print(f"[DEBUG] Created missing saved_data directory: {saved_data_path}")
 
+    config.read(CONFIG_FILE)
+
+    # Load max suggestions from config
+    global max_suggestions
+    max_suggestions = int(config['Settings'].get('max_suggestions', '10'))
+
     return saved_data_path, encryption_key
 
 def ensure_api_keys(encryption_key):
     """Ensure API keys are available, prompting the user if necessary."""
+    global omdb_key, openai_key
     omdb_key, openai_key = None, None
 
+    # Try loading existing API keys
     if os.path.exists(API_KEY_FILE):
         try:
-            # Load and decrypt the API keys
             with open(API_KEY_FILE, "rb") as file:
                 lines = file.readlines()
             omdb_key = decrypt_data(lines[0].strip(), encryption_key.encode())
             openai_key = decrypt_data(lines[1].strip(), encryption_key.encode()) if len(lines) > 1 else None
-            print(f"[DEBUG] Decrypted API keys successfully.")
         except Exception as e:
             print(f"[ERROR] Failed to decrypt API keys: {e}")
 
-    # Validate OMDb API Key
-    while not omdb_key or not validate_api_key_omdb(omdb_key):
-        omdb_key, ok = QInputDialog.getText(None, "OMDb API Key", "Enter your OMDb API Key:")
-        if not ok or not omdb_key:
-            QMessageBox.critical(None, "API Key Error", "OMDb API Key is required to run the application.")
-            sys.exit(1)
-        if not validate_api_key_omdb(omdb_key):
-            QMessageBox.warning(None, "Invalid Key", "OMDb API Key is invalid.")
+    # State 1: First run, neither key is found
+    if omdb_key is None and openai_key is None:
+        # Prompt for OMDb key
+        while not omdb_key or not validate_api_key_omdb(omdb_key):
+            omdb_prompt = (
+                '<span style="color:red;">The existing OMDb API Key is invalid. Please provide a valid one.</span>'
+                if omdb_key and not validate_api_key_omdb(omdb_key)
+                else "Please enter your OMDb API Key:"
+            )
+            omdb_dialog = CustomInputDialog("OMDb API Key", omdb_prompt, cancel_text="Exit")
+            if omdb_dialog.exec_() == QDialog.Accepted:
+                omdb_key = omdb_dialog.get_input().strip()
+            else:
+                CustomMessageDialog(
+                    title="API Key Missing",
+                    message="OMDb API Key is required to run the program.",
+                    button_options=[{"text": "Exit", "role": "exit"}],
+                    text_color="red"
+                ).exec_()
+                sys.exit("[ERROR] OMDb API Key is required.")
 
-    # Validate OpenAI API Key (optional)
-    if openai_key:
-        if not validate_api_key_openai(openai_key):
-            QMessageBox.warning(None, "Invalid Key", "OpenAI API Key is invalid. GPT-based suggestions will be disabled.")
-            openai_key = None
-    else:
-        QMessageBox.information(None, "Optional Key Missing", "OpenAI API Key is missing. GPT-based suggestions will be disabled.")
+        # Prompt for OpenAI key
+        while not openai_key or not validate_api_key_openai(openai_key):
+            gpt_prompt = (
+                '<span style="color:red;">The provided GPT API Key is invalid. Please re-enter the key.</span>'
+                if openai_key and not validate_api_key_openai(openai_key)
+                else "Enter your OpenAI GPT API Key (optional):"
+            )
+            gpt_dialog = CustomInputDialog("OpenAI GPT API Key", gpt_prompt, cancel_text="Skip")
+            if gpt_dialog.exec_() == QDialog.Accepted:
+                openai_key = gpt_dialog.get_input().strip()
+            else:
+                # If skipped, disable GPT suggestions
+                openai_key = None
+                QTimer.singleShot(500, lambda: CustomMessageDialog(
+                    title="GPT Suggestions Disabled",
+                    message="GPT-based suggestions are disabled because the OpenAI GPT API Key is missing.",
+                    button_options=[{"text": "Ok", "role": "ok"}],
+                    text_color="red"
+                ).exec_())
+                break
 
-    # Encrypt and save API keys
-    try:
-        with open(API_KEY_FILE, "wb") as file:
-            file.write(encrypt_data(omdb_key, encryption_key.encode()) + b"\n")
-            file.write(encrypt_data(openai_key or "", encryption_key.encode()) + b"\n")
-        print(f"[DEBUG] Encrypted and saved API keys successfully.")
-    except Exception as e:
-        print(f"[ERROR] Failed to save encrypted API keys: {e}")
-        sys.exit(1)
+    # State 2: OMDb key valid, OpenAI key missing or empty
+    elif omdb_key and (openai_key is None or openai_key.strip() == ""):
+        # Do not prompt for OpenAI key, just disable GPT suggestions
+        QTimer.singleShot(500, lambda: CustomMessageDialog(
+            title="GPT Suggestions Disabled",
+            message="GPT-based suggestions are disabled because the OpenAI GPT API Key is missing.",
+            button_options=[{"text": "Ok", "role": "ok"}],
+            text_color="red"
+        ).exec_())
+        openai_key = None
+
+    # State 3: OMDb key valid, OpenAI key found but invalid
+    elif omdb_key and openai_key and not validate_api_key_openai(openai_key):
+        # Prompt to revalidate OpenAI key
+        while not validate_api_key_openai(openai_key):
+            gpt_prompt = (
+                '<span style="color:red;">The provided GPT API Key is invalid. Please re-enter the key.</span>'
+            )
+            gpt_dialog = CustomInputDialog("OpenAI GPT API Key", gpt_prompt, cancel_text="Skip")
+            if gpt_dialog.exec_() == QDialog.Accepted:
+                openai_key = gpt_dialog.get_input().strip()
+            else:
+                # If skipped, disable GPT suggestions and remove invalid key
+                openai_key = None
+                QTimer.singleShot(500, lambda: CustomMessageDialog(
+                    title="GPT Suggestions Disabled",
+                    message="GPT-based suggestions are disabled.",
+                    button_options=[{"text": "Ok", "role": "ok"}],
+                    text_color="red"
+                ).exec_())
+                break
+
+    # Save API keys if they are valid
+    save_api_keys(omdb_key, openai_key, API_KEY_FILE, encryption_key)
 
     return omdb_key, openai_key
 
@@ -189,11 +291,12 @@ def decrypt_data(data, key):
 def save_api_keys(omdb_key, openai_key, api_key_file, encryption_key):
     """Save API keys securely to the specified file."""
     try:
-        encrypted_omdb_key = encrypt_data(omdb_key, encryption_key.encode())
-        encrypted_openai_key = encrypt_data(openai_key, encryption_key.encode())
         with open(api_key_file, "wb") as f:
-            f.write(encrypted_omdb_key + b"\n" + encrypted_openai_key)
-        print(f"[DEBUG] API keys saved successfully to {api_key_file}.")
+            f.write(encrypt_data(omdb_key, encryption_key) + b"\n")
+            # Only save the OpenAI key if it's not None
+            if openai_key:
+                f.write(encrypt_data(openai_key, encryption_key) + b"\n")
+        print("[DEBUG] API keys saved successfully.")
     except Exception as e:
         print(f"[ERROR] Failed to save API keys: {e}")
         raise
@@ -201,13 +304,13 @@ def save_api_keys(omdb_key, openai_key, api_key_file, encryption_key):
 def load_api_keys(api_key_file, encryption_key):
     """Load API keys securely from the specified file."""
     if not os.path.exists(api_key_file):
-        print(f"[DEBUG] API key file does not exist at: {api_key_file}")
+        print("[DEBUG] API key file not found.")
         return None, None
     try:
         with open(api_key_file, "rb") as f:
             lines = f.readlines()
-        omdb_key = decrypt_data(lines[0].strip(), encryption_key.encode())
-        openai_key = decrypt_data(lines[1].strip(), encryption_key.encode())
+        omdb_key = decrypt_data(lines[0].strip(), encryption_key)
+        openai_key = decrypt_data(lines[1].strip(), encryption_key) if len(lines) > 1 else None
         print("[DEBUG] API keys loaded successfully.")
         return omdb_key, openai_key
     except Exception as e:
@@ -348,7 +451,7 @@ async def query_llm_for_movie(input_text):
         query = (
             f"List all movies in the '{title}' series/franchise along with their release year and genres. "
             f"If the title is from a series, list its sequels/prequels in chronological order."
-            f"If the movie is standalone, list 5 similar movies from the same genre or with a similar theme. "
+            f"If the movie is standalone, list {max_suggestions} similar movies from the same genre or with a similar theme. "
             f"Only provide the titles and release years, maximum of 10"
             f"{'Include only movies from ' + year if year else ''}"
         )
@@ -387,6 +490,59 @@ async def query_llm_for_movie(input_text):
     except Exception as e:
         print(f"[ERROR] query_llm_for_movie: {e}")
         return []
+
+class ResizableSuggestionBox(QListWidget):
+    def __init__(self, parent=None, min_height=100, max_height=500):
+        super().__init__(parent)
+        self.min_height = min_height
+        self.max_height = max_height
+        self.resizing = False  # Track if the user is resizing
+
+        # Add a draggable handle at the bottom
+        self.handle_height = 15  # Increase the height of the draggable handle
+        self.handle = QLabel(self)
+        self.handle.setFixedHeight(self.handle_height)
+        self.handle.setStyleSheet("background-color: #2E2E2E;")
+        self.handle.setAlignment(Qt.AlignCenter)
+        self.handle.setText("⇕")  # Add a resize symbol for clarity
+
+        # Set the cursor for the handle to a resize icon
+        self.handle.setCursor(Qt.SizeVerCursor)
+
+        # Position the handle at the bottom of the suggestion box
+        self.handle.move(0, self.height() - self.handle_height)
+
+        # Track mouse events for resizing
+        self.handle.setMouseTracking(True)
+        self.handle.mousePressEvent = self.start_resizing
+        self.handle.mouseMoveEvent = self.resize_box
+        self.handle.mouseReleaseEvent = self.stop_resizing
+
+    def resizeEvent(self, event):
+        """Ensure the handle stays at the bottom of the suggestion box and spans the entire width."""
+        super().resizeEvent(event)
+        # Update handle width and position to match the width of the suggestion box
+        self.handle.setFixedWidth(self.width())
+        self.handle.move(0, self.height() - self.handle_height)
+
+    def start_resizing(self, event):
+        """Start resizing the suggestion box."""
+        if event.button() == Qt.LeftButton:
+            self.resizing = True
+            self.start_y = event.globalPos().y()
+            self.start_height = self.height()
+
+    def resize_box(self, event):
+        """Resize the suggestion box as the mouse moves."""
+        if self.resizing:
+            delta_y = event.globalPos().y() - self.start_y
+            new_height = self.start_height + delta_y
+            new_height = max(self.min_height, min(new_height, self.max_height))
+            self.setFixedHeight(new_height)
+
+    def stop_resizing(self, event):
+        """Stop resizing the suggestion box."""
+        self.resizing = False
 
 class DataLoadingThread(QThread):
     dataLoaded = pyqtSignal(dict)
@@ -490,59 +646,176 @@ class ImportMoviesThread(QThread):
         """Stop the thread."""
         self._is_running = False
 
-class CustomInputDialog(QDialog):
-    def __init__(self, title, prompt, parent=None):
-        super().__init__(parent)
+class CustomMessageDialog(QDialog):
+    button_pressed = pyqtSignal(str)
+
+    def __init__(self, title, message, button_options=None, text_color="white"):
+        super().__init__()
         self.setWindowTitle(title)
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #1C1C1C;
-                color: white;
-            }
-            QLineEdit {
-                background-color: #2E2E2E;
-                color: white;  /* Ensure font color is white */
-                border: 1px solid white;
-                border-radius: 5px;
-            }
-            QLabel {
-                color: white;  /* Ensure label text is white */
-            }
+        self.setStyleSheet("background-color: #1C1C1C; color: white;")
+
+        # Main layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        # Message label
+        self.label = QLabel(message, self)
+        self.label.setWordWrap(True)
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setStyleSheet(f"color: {text_color}; font-size: 16px;")
+        layout.addWidget(self.label)
+
+        # Button layout
+        button_layout = QHBoxLayout()
+        button_layout.setSpacing(12)
+
+        self.buttons = []
+        button_options = button_options or [{"text": "Ok", "role": "accept"}]
+        for option in button_options:
+            button = self.create_button(option)
+            button_layout.addWidget(button)
+            self.buttons.append(button)
+
+        layout.addLayout(button_layout)
+
+        # Base and max dimensions
+        self.base_width = 400
+        self.base_height = 200
+        self.max_width = 600
+        self.max_height = 400
+
+        self.adjust_size()
+
+    def create_button(self, option):
+        """Create a button with proper styling."""
+        button = QPushButton(option["text"], self)
+        button.setStyleSheet("""
             QPushButton {
-                background-color: #2E2E2E;
+                background-color: #4CAF50;
                 color: white;
-                border: 1px solid white;
-                border-radius: 5px;
+                font-size: 16px;
+                border-radius: 6px;
+                padding: 8px 12px;
             }
             QPushButton:hover {
-                background-color: #4E4E4E;
-            }
-            QPushButton:pressed {
-                background-color: #1E1E1E;
+                background-color: #45A049;
             }
         """)
+        button.clicked.connect(lambda: self.handle_button_click(option["role"]))
+        return button
 
-        # Layout
-        layout = QVBoxLayout()
-        self.setLayout(layout)
+    def handle_button_click(self, role):
+        """Emit button role and close dialog."""
+        self.button_pressed.emit(role)
+        self.close()  # Ensure dialog closes when button is clicked
 
-        # Prompt label
-        self.label = QLabel(prompt)
+    def adjust_size(self):
+        """Adjust dialog size dynamically based on content."""
+        self.label.adjustSize()
+
+        # Measure label and button dimensions
+        label_width = self.label.sizeHint().width()
+        label_height = self.label.sizeHint().height()
+        button_widths = [button.sizeHint().width() for button in self.buttons]
+        total_button_width = sum(button_widths) + 12 * (len(button_widths) - 1)
+        max_button_width = max(button_widths)
+
+        # Adjust width and height
+        final_width = max(self.base_width, min(self.max_width, max(label_width, total_button_width)))
+        final_height = max(self.base_height, min(self.max_height, label_height + 50 + max_button_width))
+
+        self.setFixedSize(final_width, final_height)
+
+class CustomInputDialog(QDialog):
+    def __init__(self, title, message, cancel_text="Cancel"):
+        super().__init__()
+        self.setWindowTitle(title)
+        self.setStyleSheet("background-color: #1C1C1C; color: white;")
+
+        # Main layout
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+
+        # Message label
+        self.label = QLabel(message, self)
+        self.label.setWordWrap(True)
         self.label.setAlignment(Qt.AlignCenter)
+        self.label.setStyleSheet("color: white; font-size: 16px;")
         layout.addWidget(self.label)
 
         # Input field
-        self.input_field = QLineEdit()
-        layout.addWidget(self.input_field)
+        self.line_edit = QLineEdit(self)
+        self.line_edit.setPlaceholderText("Enter here...")
+        self.line_edit.setStyleSheet("font-size: 16px; padding: 6px;")
+        layout.addWidget(self.line_edit)
 
         # Buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        self.button_box.button(QDialogButtonBox.Ok).setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                font-size: 16px;
+                border-radius: 6px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #45A049;
+            }
+        """)
+        self.button_box.button(QDialogButtonBox.Cancel).setStyleSheet("""
+            QPushButton {
+                background-color: #E74C3C;
+                color: white;
+                font-size: 16px;
+                border-radius: 6px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #C0392B;
+            }
+        """)
+        self.button_box.button(QDialogButtonBox.Cancel).setText(cancel_text)
+        self.button_box.accepted.connect(self.accept)  # Connect OK button to accept
+        self.button_box.rejected.connect(self.reject)  # Connect Cancel button to reject
+        layout.addWidget(self.button_box)
+
+        # Base and max dimensions
+        self.base_width = 350
+        self.base_height = 150
+        self.max_width = 600
+        self.max_height = 400
+
+        self.adjust_size()
+
+    def adjust_size(self):
+        """Adjust dialog size dynamically based on content."""
+        self.label.adjustSize()
+
+        # Measure dimensions
+        label_width = self.label.sizeHint().width()
+        label_height = self.label.sizeHint().height()
+        input_width = self.line_edit.sizeHint().width()
+        input_height = self.line_edit.sizeHint().height()
+        button_widths = [self.button_box.button(role).sizeHint().width() for role in [QDialogButtonBox.Ok, QDialogButtonBox.Cancel]]
+        total_button_width = sum(button_widths) + 12
+        max_button_width = max(button_widths)
+
+        # Adjust width and height
+        final_width = max(self.base_width, min(self.max_width, max(label_width, total_button_width, input_width)))
+        final_height = max(self.base_height, min(self.max_height, label_height + input_height + max_button_width + 50))
+
+        self.setFixedSize(final_width, final_height)
 
     def get_input(self):
-        return self.input_field.text().strip()
+        return self.line_edit.text()
+
+    def set_message(self, message):
+        """Update the dialog message dynamically and adjust the size."""
+        self.label.setText(message)
+        self.adjust_size()
 
 class PosterLoaderThread(QThread):
     posterLoaded = pyqtSignal(QLabel, QPixmap)
@@ -619,8 +892,11 @@ class FetchSuggestionsThread(QThread):
                 print("[DEBUG] No GPT suggestions returned.")
                 return
 
-            # Fetch OMDb details for GPT suggestions
+            # Fetch OMDb details for GPT suggestions (limited by max_suggestions)
+            count = 0
             for suggestion in gpt_suggestions:
+                if count >= max_suggestions:
+                    break
                 print(f"[DEBUG] Original GPT suggestion: {suggestion}")
                 cleaned_title = re.sub(r"^\d+\.\s*", "", suggestion.get("title", "")).strip()
                 suggestion["title"] = cleaned_title
@@ -634,6 +910,7 @@ class FetchSuggestionsThread(QThread):
                         "poster_url": omdb_result.get("Poster", ""),
                         "actors": omdb_result.get("Actors", "N/A"),
                     })
+                    count += 1
                 else:
                     # Add GPT suggestion without OMDb details if unavailable
                     self.suggestionsFetched.emit({
@@ -642,6 +919,7 @@ class FetchSuggestionsThread(QThread):
                         "poster_url": "",
                         "actors": "N/A",
                     })
+                    count += 1
         except Exception as e:
             print(f"[ERROR] fetch_and_emit_suggestions: {e}")
 
@@ -766,7 +1044,7 @@ class MovieApp(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("To Watch Movie List")
+        self.setWindowTitle("Movies List")
         self.setGeometry(100, 100, 800, 600)  # Initial window size
         self.original_table_data = {}
         self.current_suggestions = []
@@ -798,46 +1076,28 @@ class MovieApp(QWidget):
         # Add a spacer to push the button to the right
         self.top_layout.addStretch()
 
-        # Add the Revalidate API Keys button
-        self.revalidate_button = QPushButton("Switch API Keys")
-        self.revalidate_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2E2E2E;
-                color: white;
-                border: 1px solid white;
-                border-radius: 5px;
-                padding: 5px 10px;
-            }
-            QPushButton:hover {
-                background-color: #4E4E4E;
-            }
-            QPushButton:pressed {
-                background-color: #1E1E1E;
-            }
-        """)
-        self.revalidate_button.clicked.connect(self.open_revalidate_dialog)
+        gear_icon_path = resource_path("resources/gear.png")
 
-        # Add the "Move Data Directory" button
-        self.move_data_dir_button = QPushButton("Move Data Directory")
-        self.move_data_dir_button.setStyleSheet("""
+        # Add a settings button with the gear icon
+        self.settings_button = QPushButton()
+        self.settings_button.setIcon(QIcon(gear_icon_path))
+        self.settings_button.setIconSize(QSize(20, 20))
+        self.settings_button.setFixedSize(30, 30)
+        self.settings_button.setStyleSheet("""
             QPushButton {
-                background-color: #2E2E2E;
-                color: white;
-                border: 1px solid white;
-                border-radius: 5px;
-                padding: 5px 10px;
+                background-color: transparent;  /* Transparent background */
+                border: none;  /* No border */
             }
             QPushButton:hover {
-                background-color: #4E4E4E;
+                background-color: rgba(255, 255, 255, 0.1);  /* Light hover effect */
+                border-radius: 5px;  /* Optional: Rounded corners */
             }
             QPushButton:pressed {
-                background-color: #1E1E1E;
+                background-color: rgba(255, 255, 255, 0.2);  /* Press effect */
             }
         """)
-        self.move_data_dir_button.clicked.connect(self.move_data_directory)
-        self.top_layout.addWidget(self.move_data_dir_button)
-        
-        self.top_layout.addWidget(self.revalidate_button)
+        self.settings_button.clicked.connect(self.open_settings_window)
+        self.top_layout.addWidget(self.settings_button)
 
         # Add tabs
         self.tabs = QTabWidget()
@@ -855,8 +1115,27 @@ class MovieApp(QWidget):
         # Connect the tab change signal after initialization
         self.tabs.currentChanged.connect(self.hide_all_suggestion_lists)
 
+        # Add a shortcut for Ctrl+Tab and Ctrl+Shift+Tab
+        self.ctrl_tab_shortcut = QShortcut(QKeySequence("Ctrl+Tab"), self)
+        self.ctrl_tab_shortcut.activated.connect(self.next_sheet)
+
+        self.ctrl_shift_tab_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Tab"), self)
+        self.ctrl_shift_tab_shortcut.activated.connect(self.previous_sheet)
+
         # Listen for application-wide focus changes
         QApplication.instance().focusChanged.connect(self.on_focus_changed)
+
+    def next_sheet(self):
+        """Move to the next sheet (tab) dynamically."""
+        current_index = self.tabs.currentIndex()
+        next_index = (current_index + 1) % self.tabs.count()  # Wrap around to the first tab
+        self.tabs.setCurrentIndex(next_index)
+
+    def previous_sheet(self):
+        """Move to the previous sheet (tab) dynamically."""
+        current_index = self.tabs.currentIndex()
+        previous_index = (current_index - 1) % self.tabs.count()  # Wrap around to the last tab
+        self.tabs.setCurrentIndex(previous_index)
 
     def move_data_directory(self):
         """Allow the user to move the saved_data directory to a new location."""
@@ -997,30 +1276,6 @@ class MovieApp(QWidget):
             print(f"[ERROR] Failed to move save directory: {e}")
             QMessageBox.critical(self, "Move Failed", f"An error occurred while moving the directory:\n{e}")
 
-    def query_omdb_details(self, title, year=None):
-            """Query the OMDb API for movie details."""
-            try:
-                query_url = f"http://www.omdbapi.com/?t={quote(title)}&apikey={omdb_key}"
-                if year:
-                    query_url += f"&y={year}"
-
-                response = requests.get(query_url)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("Response") == "True":
-                        return {
-                            "plot": data.get("Plot", "N/A"),
-                            "rating": data.get("imdbRating", "N/A"),
-                            "cast": data.get("Actors", "N/A"),
-                        }
-                    else:
-                        print(f"[DEBUG] OMDb query failed: {data.get('Error', 'Unknown error')}")
-                else:
-                    print(f"[ERROR] OMDb request failed with status {response.status_code}")
-            except Exception as e:
-                print(f"[ERROR] Exception during OMDb query: {e}")
-            return None
-        
     def open_revalidate_dialog(self):
         """Open a dialog to allow revalidating one or both API keys."""
         print("[DEBUG] Opening revalidate API keys dialog.")
@@ -1058,13 +1313,11 @@ class MovieApp(QWidget):
 
         print(f"[DEBUG] Selected revalidation - OMDB: {omdb_revalidate}, OpenAI: {openai_revalidate}")
 
-        # Get encryption key and API key file location dynamically
         config = configparser.ConfigParser()
         config.read(CONFIG_FILE)
         encryption_key = config['Settings']['encryption_key']
         api_key_file = os.path.join(CONFIG_DIR, "api_keys.secure")
 
-        # Load existing keys in case they are not revalidated
         try:
             current_omdb_key, current_openai_key = load_api_keys(api_key_file, encryption_key)
         except Exception as e:
@@ -1074,7 +1327,7 @@ class MovieApp(QWidget):
         # Revalidate OMDB API Key
         if omdb_revalidate:
             while True:
-                omdb_dialog = CustomInputDialog("Switch OMDB API Key", "Enter new OMDB API Key:", self)
+                omdb_dialog = CustomInputDialog("Switch OMDB API Key", "Enter new OMDB API Key:", cancel_text="Cancel")
                 if omdb_dialog.exec_() == QDialog.Accepted:
                     omdb_key = omdb_dialog.get_input()
                     if not omdb_key:
@@ -1096,34 +1349,43 @@ class MovieApp(QWidget):
         # Revalidate OpenAI API Key
         if openai_revalidate:
             while True:
-                openai_dialog = CustomInputDialog("Switch OpenAI API Key", "Enter new OpenAI API Key:", self)
+                openai_dialog = CustomInputDialog("Switch OpenAI API Key", "Enter new OpenAI API Key:", cancel_text="Cancel")
                 if openai_dialog.exec_() == QDialog.Accepted:
-                    openai_key = openai_dialog.get_input()
-                    if not openai_key:
+                    new_openai_key = openai_dialog.get_input()
+                    if not new_openai_key:
                         QMessageBox.warning(self, "Invalid Key", "OpenAI API Key cannot be empty.")
                         continue
-                    if validate_api_key_openai(openai_key):
+                    if validate_api_key_openai(new_openai_key):
                         print("[DEBUG] OpenAI API Key validated successfully.")
+                        global openai_key  # Update the global variable
+                        openai_key = new_openai_key
+                        openai.api_key = new_openai_key  # Update OpenAI library with the new key
                         break
                     else:
                         QMessageBox.warning(self, "Invalid Key", "OpenAI API Key is invalid.")
                         print("[DEBUG] OpenAI API Key validation failed.")
                 else:
                     print("[DEBUG] User canceled OpenAI API Key revalidation.")
-                    openai_key = current_openai_key  # Fallback to the current key
+                    new_openai_key = current_openai_key  # Fallback to the current key
                     break
         else:
-            openai_key = current_openai_key  # Use the existing key if not revalidated
+            new_openai_key = current_openai_key  # Use the existing key if not revalidated
 
-        # Save the revalidated keys dynamically to the appropriate file
+        # Save the revalidated keys
         try:
-            save_api_keys(omdb_key, openai_key, api_key_file, encryption_key)
+            save_api_keys(omdb_key, new_openai_key, api_key_file, encryption_key)
             print("[DEBUG] API keys saved successfully.")
         except Exception as e:
             print(f"[ERROR] Failed to save API keys: {e}")
             QMessageBox.critical(self, "Save Error", "Failed to save API keys. Please try again.")
 
-        # Close the dialog after revalidation
+        # Refresh threads
+        if self.suggestion_thread and self.suggestion_thread.isRunning():
+            print("[DEBUG] Terminating active suggestion thread.")
+            self.suggestion_thread.terminate()
+            self.suggestion_thread.wait()
+            self.suggestion_thread = None
+
         dialog.accept()
         print("[DEBUG] Revalidate API keys dialog closed.")
 
@@ -1283,7 +1545,7 @@ class MovieApp(QWidget):
         filter_layout.addWidget(self.counter_tab1)
 
         # Create a floating suggestion list
-        self.suggestion_list_tab1 = QListWidget(self)
+        self.suggestion_list_tab1 = ResizableSuggestionBox(self, min_height=100, max_height=800)
         self.suggestion_list_tab1.setWindowFlags(Qt.ToolTip)
         self.suggestion_list_tab1.setStyleSheet("background-color: #1C1C1C; color: white;")
         self.suggestion_list_tab1.hide()
@@ -1447,7 +1709,7 @@ class MovieApp(QWidget):
         filter_layout.addWidget(self.counter_tab2)
 
         # Create a floating suggestion list
-        self.suggestion_list_tab2 = QListWidget(self)
+        self.suggestion_list_tab2 = ResizableSuggestionBox(self, min_height=100, max_height=800)
         self.suggestion_list_tab2.setWindowFlags(Qt.ToolTip)
         self.suggestion_list_tab2.setStyleSheet("background-color: #1C1C1C; color: white;")
         self.suggestion_list_tab2.hide()
@@ -1585,6 +1847,7 @@ class MovieApp(QWidget):
 
         # Add title to the table
         title_item = QTableWidgetItem(title)
+        title_item.setFlags(title_item.flags() & ~Qt.ItemIsEditable)
         title_item.setTextAlignment(Qt.AlignCenter)
         target_table.setItem(current_row_count, 0, title_item)
 
@@ -1607,12 +1870,15 @@ class MovieApp(QWidget):
         rating = movie_data.get("rating", "N/A")
         cast = movie_data.get("cast", "N/A")
         plot_item = QTableWidgetItem(plot)
+        plot_item.setFlags(plot_item.flags() & ~Qt.ItemIsEditable)
         plot_item.setTextAlignment(Qt.AlignCenter)
         target_table.setItem(current_row_count, 2, plot_item)
         cast_item = QTableWidgetItem(cast)
+        cast_item.setFlags(cast_item.flags() & ~Qt.ItemIsEditable)
         cast_item.setTextAlignment(Qt.AlignCenter)
         target_table.setItem(current_row_count, 3, cast_item)
         rating_item = QTableWidgetItem(rating)
+        rating_item.setFlags(rating_item.flags() & ~Qt.ItemIsEditable)
         rating_item.setTextAlignment(Qt.AlignCenter)
         target_table.setItem(current_row_count, 4, rating_item)
 
@@ -2213,7 +2479,7 @@ class MovieApp(QWidget):
 
         suggestion_list.clear()
 
-        self.current_suggestions = suggestions[:8]
+        self.current_suggestions = suggestions[:max_suggestions]
 
         # Debugging: Show the raw order from GPT
         print(f"[DEBUG] GPT-sorted suggestions: {[s['title'] for s in self.current_suggestions]}")
@@ -2282,6 +2548,11 @@ class MovieApp(QWidget):
             print(f"[DEBUG] Duplicate suggestion ignored: {suggestion}")
             return
 
+        # Respect max_suggestions (excluding the OMDb suggestion)
+        if len(self.current_suggestions) >= max_suggestions + 1:  # +1 for the OMDb suggestion
+            print(f"[DEBUG] Max suggestions reached. Ignoring suggestion: {suggestion}")
+            return
+
         # Add suggestion to the current list
         self.current_suggestions.append(suggestion)
         print(f"[DEBUG] Added to current_suggestions: {suggestion}")
@@ -2312,12 +2583,6 @@ class MovieApp(QWidget):
             self.position_suggestion_list(self.text_entry_tab1, self.suggestion_list_tab1)
         elif active_tab_index == 1:  # Tab 2
             self.position_suggestion_list(self.text_entry_tab2, self.suggestion_list_tab2)
-
-    def text_entry_focus_in_event(self, event):
-        """Re-show the suggestion list when the text box regains focus."""
-        if self.suggestion_list.count() > 0:
-            self.suggestion_list.show()
-        QLineEdit.focusInEvent(self.text_entry, event)
 
     def load_image_async(self, label, url):
         """Load image asynchronously."""
@@ -2419,17 +2684,6 @@ class MovieApp(QWidget):
         self.image_threads.clear()
 
         event.accept()
-
-    def focusOutEvent(self, event):
-        """Hide the suggestion list when the window loses focus."""
-        self.suggestion_list.hide()
-        super().focusOutEvent(event)
-    
-    def focusInEvent(self, event):
-        """Show the suggestion list again if applicable when the text box is focused."""
-        if self.text_entry.hasFocus() and self.suggestion_list.count() > 0:
-            self.suggestion_list.show()
-        super().focusInEvent(event)
 
     def add_movie_to_table(self, title, plot=None, rating=None, poster_path=None, cast=None, target_table=None):
         print(f"[DEBUG] Starting to add movie: '{title}'")
@@ -2630,43 +2884,203 @@ class MovieApp(QWidget):
         super().mousePressEvent(event)
 
     def show_popup(self, message, color="red"):
-        """Show a non-blocking popup at the top of the screen with a specified color."""
-        popup = QLabel(message, self)
+        """Show a non-blocking popup with a vertically centered message, close 'X' button, and timer."""
+        popup = QWidget(self)
+        popup_layout = QHBoxLayout(popup)
+        popup_layout.setContentsMargins(10, 0, 10, 0)  # Add padding inside the popup
+        popup_layout.setSpacing(10)  # Space between elements
+
         popup.setStyleSheet(f"""
-            QLabel {{
+            QWidget {{
                 background-color: {color};
-                color: white;
-                font: bold 14px;
-                padding: 10px;
                 border-radius: 5px;
             }}
+            QLabel {{
+                color: white;
+                font: bold 14px;
+            }}
+            QPushButton {{
+                background-color: transparent;
+                border: none;
+                color: white;
+                font: bold 14px;
+            }}
+            QPushButton:hover {{
+                color: lightgray;
+            }}
         """)
-        popup.setAlignment(Qt.AlignCenter)
-        popup.setGeometry(10, 10, self.width() - 20, 40)
+        popup.setFixedHeight(50)
+        popup.setFixedWidth(self.width() - 40)
+
+        # Message label
+        message_label = QLabel(message)
+        message_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        popup_layout.addWidget(message_label, stretch=1)
+
+        # Timer label
+        remaining_time = 3
+        timer_label = QLabel(f"{remaining_time}s")
+        timer_label.setAlignment(Qt.AlignVCenter | Qt.AlignCenter)
+        timer_label.setFixedWidth(30)
+        popup_layout.addWidget(timer_label, alignment=Qt.AlignVCenter)
+
+        # Close button
+        close_button = QPushButton("X")
+        close_button.setFixedSize(30, 30)
+        close_button.clicked.connect(lambda: self.remove_popup(popup))  # Close the popup on click
+        popup_layout.addWidget(close_button, alignment=Qt.AlignVCenter)
+
+        popup.setLayout(popup_layout)
+
+        # Add popup to the active popups list
+        if not hasattr(self, "active_popups"):
+            self.active_popups = []
+        self.active_popups.append(popup)
+
+        # Position popups
+        self.adjust_popups()
+
         popup.show()
 
-        # Hide the popup after 3 seconds
-        QTimer.singleShot(3000, popup.deleteLater)
-            
-    def get_top_actors(self, title, year):
-        """Fetch the top 5 actors/actresses for the given title and year."""
-        try:
-            url = f"http://www.omdbapi.com/?t={quote(title)}&y={year}&apikey={omdb_key}"
-            response = requests.get(url)
-            data = response.json()
-            if data.get("Response") == "True":
-                actors = data.get("Actors", "").split(", ")
-                return actors[:5]  # Return only the first 5 actors
-        except Exception as e:
-            print(f"[ERROR] Failed to fetch actors for '{title}': {e}")
-        return []
+        # Timer logic
+        def update_timer():
+            nonlocal remaining_time
+            remaining_time -= 1
+            timer_label.setText(f"{remaining_time}s")
+            if remaining_time <= 0:
+                self.remove_popup(popup)
 
-    def process_suggestions_with_year(self, suggestions, query_year, suggestion_list, text_entry):
-        if query_year:
-            suggestions = [
-                s for s in suggestions if s["year"] == query_year
-            ]
-        self.update_suggestions(suggestions, suggestion_list, text_entry)
+        # Create a QTimer to update the timer label every second
+        popup_timer = QTimer(popup)
+        popup_timer.timeout.connect(update_timer)
+        popup_timer.start(1000)
+
+    def adjust_popups(self):
+        """Reposition popups so they stack from the top."""
+        y_offset = 10
+        for popup in reversed(self.active_popups):
+            popup.move(10, y_offset)
+            y_offset += popup.height() + 10
+
+    def remove_popup(self, popup):
+        """Remove popup and adjust positions."""
+        if popup in self.active_popups:
+            self.active_popups.remove(popup)
+            popup.deleteLater()  # Safely delete the popup
+            self.adjust_popups()
+
+    def center_window(self):
+            """Center the main window on the screen."""
+            screen_geometry = QApplication.desktop().screenGeometry()
+            window_geometry = self.frameGeometry()
+            center_point = screen_geometry.center()
+            window_geometry.moveCenter(center_point)
+            self.move(window_geometry.topLeft())
+
+    def keyPressEvent(self, event):
+        """Handle key press events."""
+        if event.key() == Qt.Key_Backslash:  # Check for the "\" key
+            self.show_popup("This is a test popup!", color="blue")
+        super().keyPressEvent(event)  # Call the parent class method for other key events
+
+    def open_settings_window(self):
+        """Open the settings window."""
+        settings_window = QDialog(self)
+        settings_window.setWindowTitle("Settings")
+        settings_window.setFixedSize(400, 300)
+        settings_window.setStyleSheet("background-color: #1C1C1C; color: white;")
+
+        layout = QGridLayout(settings_window)
+        layout.setSpacing(5)
+
+        # Add Switch API Keys button
+        switch_api_keys_button = QPushButton("Switch API Keys")
+        switch_api_keys_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        switch_api_keys_button.clicked.connect(self.open_revalidate_dialog)
+        layout.addWidget(switch_api_keys_button, 0, 0, 1, 3)
+
+        # Add Move Data Directory button
+        move_data_dir_button = QPushButton("Move Data Directory")
+        move_data_dir_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        move_data_dir_button.clicked.connect(self.move_data_directory)
+        layout.addWidget(move_data_dir_button, 1, 0, 1, 3)
+
+        # Add Max Suggestions entry and Save button in the next row
+        max_suggestions_label = QLabel("Maximum Suggestions:")
+        max_suggestions_label.setStyleSheet("color: white;")
+        layout.addWidget(max_suggestions_label, 3, 0)  # Adjusted to row 3
+
+        max_suggestions_entry = QLineEdit(str(max_suggestions))
+        max_suggestions_entry.setValidator(QIntValidator(1, 100))
+        layout.addWidget(max_suggestions_entry, 3, 1)  # Adjusted to row 3
+
+        save_button = QPushButton("Save")
+        save_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #45A049;
+            }
+        """)
+        save_button.clicked.connect(lambda: self.save_settings(max_suggestions_entry.text(), settings_window))
+        layout.addWidget(save_button, 3, 2)  # Adjusted to row 3
+
+        # Add an empty row
+        empty_widget1 = QWidget()  # This will be an empty row
+        layout.addWidget(empty_widget1, 4, 0)
+
+        # Add another empty row if needed
+        empty_widget2 = QWidget()  # Another empty row
+        layout.addWidget(empty_widget2, 5, 0)
+
+        settings_window.setLayout(layout)
+        settings_window.exec_()
+
+    def save_settings(self, max_suggestions_value, settings_window):
+        global max_suggestions
+        try:
+            max_suggestions = int(max_suggestions_value)
+            config = configparser.ConfigParser()
+            config.read(CONFIG_FILE)
+            config['Settings']['max_suggestions'] = str(max_suggestions)
+            with open(CONFIG_FILE, 'w') as configfile:
+                config.write(configfile)
+            settings_window.accept()
+            self.show_popup("Settings saved successfully.", color="green")
+        except ValueError:
+            self.show_popup("Invalid value for maximum suggestions.", color="red")
 
 def main():
     global omdb_key, openai_key
@@ -2683,6 +3097,7 @@ def main():
 
         # Initialize and show the main application window
         window = MovieApp()
+        window.center_window()
         window.show()
 
         # Process UI events immediately to prevent a blank screen
