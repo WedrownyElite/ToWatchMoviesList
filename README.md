@@ -57,3 +57,12 @@ OMDb API Key: You can get a free API key from OMDb. This is required for the pro
 GPT API Key: GPT functionality is optional. Without it, you will only see an exact match suggestion from OMDb. The GPT API key is not free
 Feel free to reach out or open an issue if you encounter any problems!
 wedrownyelite@gmail.com
+
+![MoviesList-Base](https://github.com/user-attachments/assets/d77622c6-0bb2-4e2d-9a7f-eaedf6aafa08)
+MoviesList
+![MoviesList-RightClick](https://github.com/user-attachments/assets/c571b346-604b-48cb-a209-74bacb64a753)
+Right Click options
+![MoviesList-Settings](https://github.com/user-attachments/assets/13ecd970-6667-43af-8606-168acdce2ad3)
+Settings
+![MoviesList-Suggestions](https://github.com/user-attachments/assets/21191bf6-4900-4544-8151-61b5ca3755c7)
+Suggestions (With GPT API key)
