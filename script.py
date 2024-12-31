@@ -491,59 +491,6 @@ async def query_llm_for_movie(input_text):
         print(f"[ERROR] query_llm_for_movie: {e}")
         return []
 
-class ResizableSuggestionBox(QListWidget):
-    def __init__(self, parent=None, min_height=100, max_height=500):
-        super().__init__(parent)
-        self.min_height = min_height
-        self.max_height = max_height
-        self.resizing = False  # Track if the user is resizing
-
-        # Add a draggable handle at the bottom
-        self.handle_height = 15  # Increase the height of the draggable handle
-        self.handle = QLabel(self)
-        self.handle.setFixedHeight(self.handle_height)
-        self.handle.setStyleSheet("background-color: #2E2E2E;")
-        self.handle.setAlignment(Qt.AlignCenter)
-        self.handle.setText("⇕")  # Add a resize symbol for clarity
-
-        # Set the cursor for the handle to a resize icon
-        self.handle.setCursor(Qt.SizeVerCursor)
-
-        # Position the handle at the bottom of the suggestion box
-        self.handle.move(0, self.height() - self.handle_height)
-
-        # Track mouse events for resizing
-        self.handle.setMouseTracking(True)
-        self.handle.mousePressEvent = self.start_resizing
-        self.handle.mouseMoveEvent = self.resize_box
-        self.handle.mouseReleaseEvent = self.stop_resizing
-
-    def resizeEvent(self, event):
-        """Ensure the handle stays at the bottom of the suggestion box and spans the entire width."""
-        super().resizeEvent(event)
-        # Update handle width and position to match the width of the suggestion box
-        self.handle.setFixedWidth(self.width())
-        self.handle.move(0, self.height() - self.handle_height)
-
-    def start_resizing(self, event):
-        """Start resizing the suggestion box."""
-        if event.button() == Qt.LeftButton:
-            self.resizing = True
-            self.start_y = event.globalPos().y()
-            self.start_height = self.height()
-
-    def resize_box(self, event):
-        """Resize the suggestion box as the mouse moves."""
-        if self.resizing:
-            delta_y = event.globalPos().y() - self.start_y
-            new_height = self.start_height + delta_y
-            new_height = max(self.min_height, min(new_height, self.max_height))
-            self.setFixedHeight(new_height)
-
-    def stop_resizing(self, event):
-        """Stop resizing the suggestion box."""
-        self.resizing = False
-
 class DataLoadingThread(QThread):
     dataLoaded = pyqtSignal(dict)
 
@@ -863,14 +810,14 @@ class FetchSuggestionsThread(QThread):
     async def fetch_and_emit_suggestions(self):
         """Fetch suggestions from OMDb and optionally GPT."""
         try:
-            # Extract title and optional year
+            # Parse input text for title and year
             match = re.match(r"(.+?)\s+(\d{4})$", self.text.strip())
             title = match.group(1).strip() if match else self.text.strip()
             year = match.group(2).strip() if match else None
 
             print(f"[DEBUG] Fetching suggestions for: '{title}' ({year})")
 
-            # Try exact search in OMDb
+            # First attempt: Fetch exact match with title and year
             omdb_result = await self.fetch_omdb_details(title, year)
             if omdb_result:
                 print(f"[DEBUG] Exact match found in OMDb: {omdb_result}")
@@ -881,54 +828,36 @@ class FetchSuggestionsThread(QThread):
                     "actors": omdb_result.get("Actors", "N/A"),
                 })
 
-            # Skip GPT-based suggestions if the OpenAI API key is missing
-            if not openai_key:
-                print("[DEBUG] Skipping GPT suggestions as OpenAI API key is not provided.")
-                return
-
-            # Call GPT API for additional suggestions
+            # Fetch GPT-based suggestions
             gpt_suggestions = await query_llm_for_movie(self.text)
-            if not gpt_suggestions:
+            if gpt_suggestions:
+                for suggestion in gpt_suggestions[:max_suggestions]:
+                    print(f"[DEBUG] Processing GPT suggestion: {suggestion}")
+                    # Clean suggestion titles
+                    suggestion_title = re.sub(r"^\d+\.\s*", "", suggestion["title"]).strip()
+                    suggestion_year = suggestion.get("year", "")
+                    omdb_result = await self.fetch_omdb_details(suggestion_title, suggestion_year)
+
+                    # Use OMDb data if available; otherwise, use GPT suggestion directly
+                    self.suggestionsFetched.emit({
+                        "title": omdb_result.get("Title", suggestion_title) if omdb_result else suggestion_title,
+                        "year": omdb_result.get("Year", suggestion_year) if omdb_result else suggestion_year,
+                        "poster_url": omdb_result.get("Poster", "") if omdb_result else "",
+                        "actors": omdb_result.get("Actors", "N/A") if omdb_result else "N/A",
+                    })
+                    print(f"[DEBUG] Emitted suggestion: {suggestion}")
+            else:
                 print("[DEBUG] No GPT suggestions returned.")
-                return
 
-            # Fetch OMDb details for GPT suggestions (limited by max_suggestions)
-            count = 0
-            for suggestion in gpt_suggestions:
-                if count >= max_suggestions:
-                    break
-                print(f"[DEBUG] Original GPT suggestion: {suggestion}")
-                cleaned_title = re.sub(r"^\d+\.\s*", "", suggestion.get("title", "")).strip()
-                suggestion["title"] = cleaned_title
-                print(f"[DEBUG] Cleaned GPT title: {suggestion['title']}")
-
-                omdb_result = await self.fetch_omdb_details(suggestion["title"], suggestion.get("year"))
-                if omdb_result:
-                    self.suggestionsFetched.emit({
-                        "title": omdb_result.get("Title", ""),
-                        "year": omdb_result.get("Year", ""),
-                        "poster_url": omdb_result.get("Poster", ""),
-                        "actors": omdb_result.get("Actors", "N/A"),
-                    })
-                    count += 1
-                else:
-                    # Add GPT suggestion without OMDb details if unavailable
-                    self.suggestionsFetched.emit({
-                        "title": suggestion["title"],
-                        "year": suggestion.get("year", ""),
-                        "poster_url": "",
-                        "actors": "N/A",
-                    })
-                    count += 1
         except Exception as e:
             print(f"[ERROR] fetch_and_emit_suggestions: {e}")
 
     async def fetch_omdb_details(self, title, year=None):
-        """Query the OMDb API asynchronously."""
+        """Query the OMDb API asynchronously with optional year handling."""
         try:
             query_url = f"http://www.omdbapi.com/?t={quote(title)}"
             if year:
-                query_url += f"&y={year}"
+                query_url += f"&y={year}"  # Include the year in the query if provided
             query_url += f"&apikey={omdb_key}"
 
             print(f"[DEBUG] Fetching OMDb details for: {query_url}")
@@ -939,7 +868,7 @@ class FetchSuggestionsThread(QThread):
                         if data.get("Response") == "True":
                             return data
                         else:
-                            print(f"[DEBUG] OMDb fetch failed for '{title}': {data.get('Error', 'Unknown error')}")
+                            print(f"[DEBUG] OMDb fetch failed for '{title}' ({year}): {data.get('Error', 'Unknown error')}")
                     else:
                         print(f"[ERROR] OMDb request failed with status {response.status} for {query_url}")
             return None
@@ -1040,6 +969,69 @@ class FilterMoviesThread(QThread):
         """Stop the thread."""
         self._is_running = False
 
+class ResizableSuggestionBox(QListWidget):
+    def __init__(self, parent=None, min_height=100, max_height=200):
+        super().__init__(parent)
+        self.min_height = min_height
+        self.max_height = max_height
+        self.resizing = False  # Track if the user is resizing
+
+        # Add a draggable handle at the bottom
+        self.handle_height = 15  # Increase the height of the draggable handle
+        self.handle = QLabel(self)
+        self.handle.setFixedHeight(self.handle_height)
+        self.handle.setStyleSheet("background-color: #2E2E2E;")
+        self.handle.setAlignment(Qt.AlignCenter)
+        self.handle.setText("⇕")  # Add a resize symbol for clarity
+
+        # Set the cursor for the handle to a resize icon
+        self.handle.setCursor(Qt.SizeVerCursor)
+
+        # Position the handle at the bottom of the suggestion box
+        self.handle.move(0, self.height() - self.handle_height)
+
+        # Track mouse events for resizing
+        self.handle.setMouseTracking(True)
+        self.handle.mousePressEvent = self.start_resizing
+        self.handle.mouseMoveEvent = self.resize_box
+        self.handle.mouseReleaseEvent = self.stop_resizing
+
+    def resizeEvent(self, event):
+        """Ensure the handle stays at the bottom of the suggestion box and spans the entire width."""
+        super().resizeEvent(event)
+        # Update handle width and position to match the width of the suggestion box
+        self.handle.setFixedWidth(self.width())
+        self.handle.move(0, self.height() - self.handle_height)
+
+    def start_resizing(self, event):
+        """Start resizing the suggestion box."""
+        if event.button() == Qt.LeftButton:
+            self.resizing = True
+            self.start_y = event.globalPos().y()
+            self.start_height = self.height()
+
+    def resize_box(self, event):
+        """Resize the suggestion box as the mouse moves."""
+        if self.resizing:
+            delta_y = event.globalPos().y() - self.start_y
+            new_height = self.start_height + delta_y
+
+            # Clamp the height within the allowed range
+            if new_height > self.max_height:
+                new_height = self.max_height  # Snap to max height
+                self.resizing = False  # Stop further resizing
+
+            elif new_height < self.min_height:
+                new_height = self.min_height  # Snap to min height
+
+            # Set the height and update the handle position
+            self.setFixedHeight(new_height)
+            self.handle.move(0, self.height() - self.handle_height)
+
+    def stop_resizing(self, event):
+        """Stop resizing the suggestion box."""
+        self.resizing = False
+
 class MovieApp(QWidget):
 
     def __init__(self):
@@ -1125,323 +1117,9 @@ class MovieApp(QWidget):
         # Listen for application-wide focus changes
         QApplication.instance().focusChanged.connect(self.on_focus_changed)
 
-    def next_sheet(self):
-        """Move to the next sheet (tab) dynamically."""
-        current_index = self.tabs.currentIndex()
-        next_index = (current_index + 1) % self.tabs.count()  # Wrap around to the first tab
-        self.tabs.setCurrentIndex(next_index)
-
-    def previous_sheet(self):
-        """Move to the previous sheet (tab) dynamically."""
-        current_index = self.tabs.currentIndex()
-        previous_index = (current_index - 1) % self.tabs.count()  # Wrap around to the last tab
-        self.tabs.setCurrentIndex(previous_index)
-
-    def move_data_directory(self):
-        """Allow the user to move the saved_data directory to a new location."""
-        print("[DEBUG] User initiated move of the saved_data directory.")
-        
-        # Create a custom dialog
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Move Save Directory")
-        dialog.setStyleSheet("background-color: #1C1C1C; color: white;")
-        layout = QVBoxLayout(dialog)
-
-        # Add instructions
-        instructions = QLabel(
-            "Would you like to open an existing save directory or create a new one?"
-        )
-        instructions.setWordWrap(True)
-        instructions.setAlignment(Qt.AlignCenter)  # Center align the text
-        instructions.setStyleSheet("color: white; font-size: 14px;")
-        layout.addWidget(instructions)
-
-        # Add buttons for choices
-        open_button = QPushButton("Open Existing Directory")
-        open_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2E2E2E;
-                color: white;
-                border: 1px solid white;
-                border-radius: 5px;
-                padding: 5px 10px;
-            }
-            QPushButton:hover {
-                background-color: #4E4E4E;
-            }
-            QPushButton:pressed {
-                background-color: #1E1E1E;
-            }
-        """)
-        layout.addWidget(open_button)
-
-        create_button = QPushButton("Create New Directory")
-        create_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2E2E2E;
-                color: white;
-                border: 1px solid white;
-                border-radius: 5px;
-                padding: 5px 10px;
-            }
-            QPushButton:hover {
-                background-color: #4E4E4E;
-            }
-            QPushButton:pressed {
-                background-color: #1E1E1E;
-            }
-        """)
-        layout.addWidget(create_button)
-
-        # Cancel button
-        cancel_button = QPushButton("Cancel")
-        cancel_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2E2E2E;
-                color: white;
-                border: 1px solid white;
-                border-radius: 5px;
-                padding: 5px 10px;
-            }
-            QPushButton:hover {
-                background-color: #4E4E4E;
-            }
-            QPushButton:pressed {
-                background-color: #1E1E1E;
-            }
-        """)
-        layout.addWidget(cancel_button)
-
-        def handle_open():
-            dir_dialog = QFileDialog()
-            dir_path = dir_dialog.getExistingDirectory(dialog, "Select Existing Directory for MoviesList")
-            if dir_path:
-                self.move_to_selected_directory(dir_path)
-                dialog.accept()
-            else:
-                QMessageBox.warning(dialog, "Invalid Directory", "You must select a directory.")
-
-        def handle_create():
-            dir_dialog = QFileDialog()
-            dir_path = dir_dialog.getExistingDirectory(dialog, "Select Parent Directory for New MoviesList")
-            if dir_path:
-                new_movies_list_path = os.path.join(dir_path, "MoviesList")
-                os.makedirs(new_movies_list_path, exist_ok=True)
-                self.move_to_selected_directory(new_movies_list_path)
-                dialog.accept()
-            else:
-                QMessageBox.warning(dialog, "Invalid Directory", "You must select a directory.")
-
-        def handle_cancel():
-            dialog.reject()
-
-        open_button.clicked.connect(handle_open)
-        create_button.clicked.connect(handle_create)
-        cancel_button.clicked.connect(handle_cancel)
-
-        dialog.exec_()
-
-    def move_to_selected_directory(self, new_dir_path):
-        """Move the save data to the selected directory."""
-        try:
-            old_dir_path = MovieApp.SAVE_DIR
-
-            # Move files to the new directory
-            for item in os.listdir(old_dir_path):
-                old_item_path = os.path.join(old_dir_path, item)
-                new_item_path = os.path.join(new_dir_path, item)
-                if os.path.isdir(old_item_path):
-                    os.rename(old_item_path, new_item_path)
-                else:
-                    os.replace(old_item_path, new_item_path)
-
-            print(f"[DEBUG] Data moved successfully from {old_dir_path} to {new_dir_path}.")
-
-            # Update the config file
-            config = configparser.ConfigParser()
-            config.read(CONFIG_FILE)
-            config['Settings']['saved_data_dir'] = new_dir_path
-            with open(CONFIG_FILE, 'w') as configfile:
-                config.write(configfile)
-            print(f"[DEBUG] Updated config.ini with new directory: {new_dir_path}")
-
-            # Delete the old directory
-            os.rmdir(old_dir_path)
-            print(f"[DEBUG] Deleted old directory: {old_dir_path}")
-
-            # Update the application state
-            MovieApp.SAVE_DIR = new_dir_path
-            self.show_popup("Save directory moved successfully.", color="green")
-        except Exception as e:
-            print(f"[ERROR] Failed to move save directory: {e}")
-            QMessageBox.critical(self, "Move Failed", f"An error occurred while moving the directory:\n{e}")
-
-    def open_revalidate_dialog(self):
-        """Open a dialog to allow revalidating one or both API keys."""
-        print("[DEBUG] Opening revalidate API keys dialog.")
-        
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Switch API Keys")
-        dialog.setStyleSheet("background-color: #1C1C1C; color: white;")
-        layout = QFormLayout(dialog)
-
-        # Add checkboxes for selecting keys to revalidate
-        self.omdb_checkbox = QCheckBox("Switch OMDB API Key")
-        self.omdb_checkbox.setStyleSheet("color: white;")
-        layout.addRow(self.omdb_checkbox)
-
-        self.openai_checkbox = QCheckBox("Switch OpenAI API Key")
-        self.openai_checkbox.setStyleSheet("color: white;")
-        layout.addRow(self.openai_checkbox)
-
-        # Add dialog buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        layout.addWidget(buttons)
-
-        # Connect the dialog buttons
-        buttons.accepted.connect(lambda: self.handle_revalidate_keys(dialog))
-        buttons.rejected.connect(dialog.reject)
-
-        # Show dialog
-        dialog.exec_()
-        print("[DEBUG] Revalidate API keys dialog closed.")
-
-    def handle_revalidate_keys(self, dialog):
-        print("[DEBUG] Revalidate API keys dialog confirmed.")
-        omdb_revalidate = self.omdb_checkbox.isChecked()
-        openai_revalidate = self.openai_checkbox.isChecked()
-
-        print(f"[DEBUG] Selected revalidation - OMDB: {omdb_revalidate}, OpenAI: {openai_revalidate}")
-
-        config = configparser.ConfigParser()
-        config.read(CONFIG_FILE)
-        encryption_key = config['Settings']['encryption_key']
-        api_key_file = os.path.join(CONFIG_DIR, "api_keys.secure")
-
-        try:
-            current_omdb_key, current_openai_key = load_api_keys(api_key_file, encryption_key)
-        except Exception as e:
-            print(f"[ERROR] Failed to load existing API keys: {e}")
-            current_omdb_key, current_openai_key = None, None
-
-        # Revalidate OMDB API Key
-        if omdb_revalidate:
-            while True:
-                omdb_dialog = CustomInputDialog("Switch OMDB API Key", "Enter new OMDB API Key:", cancel_text="Cancel")
-                if omdb_dialog.exec_() == QDialog.Accepted:
-                    omdb_key = omdb_dialog.get_input()
-                    if not omdb_key:
-                        QMessageBox.warning(self, "Invalid Key", "OMDB API Key cannot be empty.")
-                        continue
-                    if validate_api_key_omdb(omdb_key):
-                        print("[DEBUG] OMDB API Key validated successfully.")
-                        break
-                    else:
-                        QMessageBox.warning(self, "Invalid Key", "OMDB API Key is invalid.")
-                        print("[DEBUG] OMDB API Key validation failed.")
-                else:
-                    print("[DEBUG] User canceled OMDB API Key revalidation.")
-                    omdb_key = current_omdb_key  # Fallback to the current key
-                    break
-        else:
-            omdb_key = current_omdb_key  # Use the existing key if not revalidated
-
-        # Revalidate OpenAI API Key
-        if openai_revalidate:
-            while True:
-                openai_dialog = CustomInputDialog("Switch OpenAI API Key", "Enter new OpenAI API Key:", cancel_text="Cancel")
-                if openai_dialog.exec_() == QDialog.Accepted:
-                    new_openai_key = openai_dialog.get_input()
-                    if not new_openai_key:
-                        QMessageBox.warning(self, "Invalid Key", "OpenAI API Key cannot be empty.")
-                        continue
-                    if validate_api_key_openai(new_openai_key):
-                        print("[DEBUG] OpenAI API Key validated successfully.")
-                        global openai_key  # Update the global variable
-                        openai_key = new_openai_key
-                        openai.api_key = new_openai_key  # Update OpenAI library with the new key
-                        break
-                    else:
-                        QMessageBox.warning(self, "Invalid Key", "OpenAI API Key is invalid.")
-                        print("[DEBUG] OpenAI API Key validation failed.")
-                else:
-                    print("[DEBUG] User canceled OpenAI API Key revalidation.")
-                    new_openai_key = current_openai_key  # Fallback to the current key
-                    break
-        else:
-            new_openai_key = current_openai_key  # Use the existing key if not revalidated
-
-        # Save the revalidated keys
-        try:
-            save_api_keys(omdb_key, new_openai_key, api_key_file, encryption_key)
-            print("[DEBUG] API keys saved successfully.")
-        except Exception as e:
-            print(f"[ERROR] Failed to save API keys: {e}")
-            QMessageBox.critical(self, "Save Error", "Failed to save API keys. Please try again.")
-
-        # Refresh threads
-        if self.suggestion_thread and self.suggestion_thread.isRunning():
-            print("[DEBUG] Terminating active suggestion thread.")
-            self.suggestion_thread.terminate()
-            self.suggestion_thread.wait()
-            self.suggestion_thread = None
-
-        dialog.accept()
-        print("[DEBUG] Revalidate API keys dialog closed.")
-
-    def save_movies(self):
-        """Save movies to the JSON file in the user-defined directory."""
-        try:
-            file_path = os.path.join(self.SAVE_DIR, "movies.json")
-            with open(file_path, "w") as file:
-                json.dump(self.saved_movies, file, indent=4)
-            print(f"[DEBUG] Movies saved to file at: {file_path}")
-        except Exception as e:
-            print(f"[ERROR] Failed to save movies: {e}")
-    
-    def download_poster(self, url, title):
-        """Download and save the poster image locally in the user-defined directory."""
-        poster_path = os.path.join(self.SAVE_DIR, f"{title}.jpg")
-        if os.path.exists(poster_path):
-            return poster_path  # Return if already exists
-
-        try:
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                with open(poster_path, "wb") as file:
-                    file.write(response.content)
-                return poster_path
-            else:
-                print(f"[ERROR] Failed to download poster. HTTP Status: {response.status_code}")
-        except Exception as e:
-            print(f"[ERROR] Exception while downloading poster: {e}")
-
-        return None  # Return None if download fails
-
-    def get_or_download_poster(self, poster_url, title):
-        """Get the poster from saved data or use a placeholder if unavailable."""
-        if not poster_url or poster_url == "N/A":  # Handle missing or invalid URLs
-            print(f"[DEBUG] Poster URL is invalid for title: {title}")
-            return "path/to/placeholder/image.jpg"  # Replace with an actual path to a placeholder image
-
-        poster_path = os.path.join(self.SAVE_DIR, f"{title}.jpg")
-        if os.path.exists(poster_path):
-            return poster_path
-
-        try:
-            response = requests.get(poster_url, timeout=5)
-            if response.status_code == 200:
-                with open(poster_path, "wb") as file:
-                    file.write(response.content)
-                return poster_path
-            else:
-                print(f"[ERROR] Failed to download poster. HTTP Status: {response.status_code}")
-        except Exception as e:
-            print(f"[ERROR] Exception while downloading poster: {e}")
-
-        # Use the placeholder if download fails
-        return "path/to/placeholder/image.jpg"
-    
+    # -----------------------------------
+    # Layout Setup and Initialization
+    # -----------------------------------
     def setup_tab1(self):
         """Set up the layout and widgets for Tab 1."""
         tab1_layout = QVBoxLayout()
@@ -1463,8 +1141,8 @@ class MovieApp(QWidget):
         import_button_tab1_layout.setAlignment(Qt.AlignCenter)
 
         # Import Button
-        import_button_tab1 = QPushButton("Import")
-        import_button_tab1.setStyleSheet("""
+        self.import_button_tab1 = QPushButton("Import")
+        self.import_button_tab1.setStyleSheet("""
             QPushButton {
                 background-color: #2E2E2E;
                 color: white;
@@ -1479,12 +1157,12 @@ class MovieApp(QWidget):
                 background-color: #1E1E1E;
             }
         """)
-        import_button_tab1.clicked.connect(lambda: self.import_movies(self.table_tab1 if self.tabs.currentIndex() == 0 else self.table_tab2))
-        import_button_tab1.setMinimumWidth(50)
-        import_button_tab1.setMaximumWidth(100)
+        self.import_button_tab1.clicked.connect(lambda: self.import_movies(self.table_tab1 if self.tabs.currentIndex() == 0 else self.table_tab2))
+        self.import_button_tab1.setMinimumWidth(50)
+        self.import_button_tab1.setMaximumWidth(100)
 
         # Add import  button to import container
-        import_button_tab1_layout.addWidget(import_button_tab1)
+        import_button_tab1_layout.addWidget(self.import_button_tab1)
         # Add import container to layout
         tab1_layout.addWidget(import_button_tab1_container)
 
@@ -1627,8 +1305,8 @@ class MovieApp(QWidget):
         import_button_tab2_layout.setAlignment(Qt.AlignCenter)
 
         # Import Button
-        import_button_tab2 = QPushButton("Import")
-        import_button_tab2.setStyleSheet("""
+        self.import_button_tab2 = QPushButton("Import")
+        self.import_button_tab2.setStyleSheet("""
             QPushButton {
                 background-color: #2E2E2E;
                 color: white;
@@ -1643,12 +1321,12 @@ class MovieApp(QWidget):
                 background-color: #1E1E1E;
             }
         """)
-        import_button_tab2.clicked.connect(lambda: self.import_movies(self.table_tab1 if self.tabs.currentIndex() == 0 else self.table_tab2))
-        import_button_tab2.setMinimumWidth(50)
-        import_button_tab2.setMaximumWidth(100)
+        self.import_button_tab2.clicked.connect(lambda: self.import_movies(self.table_tab1 if self.tabs.currentIndex() == 0 else self.table_tab2))
+        self.import_button_tab2.setMinimumWidth(50)
+        self.import_button_tab2.setMaximumWidth(100)
 
         # Add import  button to import container
-        import_button_tab2_layout.addWidget(import_button_tab2)
+        import_button_tab2_layout.addWidget(self.import_button_tab2)
         # Add import container to layout
         tab2_layout.addWidget(import_button_tab2_container)
         
@@ -1771,478 +1449,98 @@ class MovieApp(QWidget):
 
         self.thread = None
 
-    def _load_and_populate_data_in_thread(self):
-        """Load and populate data incrementally in a background thread."""
-        self.is_busy = True  # Disable interactions
-        self.disable_user_interaction()
-        self.saved_movies = self.load_saved_movies()
+    def open_settings_window(self):
+        """Open the settings window."""
+        settings_window = QDialog(self)
+        settings_window.setWindowTitle("Settings")
+        settings_window.setFixedSize(400, 300)
+        settings_window.setStyleSheet("background-color: #1C1C1C; color: white;")
 
-        self.loading_thread = DataLoadingThread(self.saved_movies)
-        self.loading_thread.dataLoaded.connect(
-            lambda movie_data: self.add_movie_to_table_incrementally(
-                movie_data,
-                self.table_tab1 if movie_data.get("list") == "To Watch List" else self.table_tab2
-            )
-        )
-        self.loading_thread.finished.connect(self.on_data_loaded)
-        self.loading_thread.start()
+        layout = QGridLayout(settings_window)
+        layout.setSpacing(5)
 
-    def on_data_loaded(self):
-        """Handle the end of the data loading process."""
-        self.is_busy = False  # Re-enable interactions
-        self.enable_user_interaction()
-        self.show_popup("Data loading complete. You can now move or delete titles.", color="green")
-
-        # Update tab names with the current counts
-        self.update_counter(self.counter_tab1, self.table_tab1)
-        self.update_counter(self.counter_tab2, self.table_tab2)
-
-    def disable_user_interaction(self):
-        """Disable search, filter, and table interactions."""
-        self.text_entry_tab1.setEnabled(False)
-        self.text_entry_tab2.setEnabled(False)
-        self.filter_entry_tab1.setEnabled(False)
-        self.filter_entry_tab2.setEnabled(False)
-        self.table_tab1.setEnabled(False)
-        self.table_tab2.setEnabled(False)
-    
-    def load_saved_movies(self):
-        """Load saved movies from the JSON file in the user-defined directory."""
-        try:
-            file_path = os.path.join(self.SAVE_DIR, "movies.json")
-            print(f"[DEBUG] Attempting to load movies from: {file_path}")
-            if os.path.exists(file_path):
-                with open(file_path, "r") as file:
-                    saved_movies = json.load(file)
-                    print(f"[DEBUG] Successfully loaded movies: {json.dumps(saved_movies, indent=4)}")
-                    return saved_movies
-            else:
-                print("[DEBUG] No saved movies file found. Returning empty dictionary.")
-                return {}
-        except json.JSONDecodeError as e:
-            print(f"[ERROR] Failed to parse saved movies JSON: {e}")
-            return {}
-        except Exception as e:
-            print(f"[ERROR] Failed to load saved movies: {e}")
-            return {}
-    
-    def enable_user_interaction(self):
-        """Re-enable search, filter, and table interactions."""
-        self.text_entry_tab1.setEnabled(True)
-        self.text_entry_tab2.setEnabled(True)
-        self.filter_entry_tab1.setEnabled(True)
-        self.filter_entry_tab2.setEnabled(True)
-        self.table_tab1.setEnabled(True)
-        self.table_tab2.setEnabled(True)
-
-    def add_movie_to_table_incrementally(self, movie_data, target_table):
-        """Add movies to the specified table incrementally and check for poster."""
-        current_row_count = target_table.rowCount()
-        target_table.insertRow(current_row_count)
-
-        # Check if the poster exists, otherwise fetch it
-        title = movie_data.get("title", "Unknown Title")
-        poster_path = movie_data.get("poster_path", "")
-        poster_path = self.get_or_download_poster(poster_path, title)
-
-        # Add title to the table
-        title_item = QTableWidgetItem(title)
-        title_item.setFlags(title_item.flags() & ~Qt.ItemIsEditable)
-        title_item.setTextAlignment(Qt.AlignCenter)
-        target_table.setItem(current_row_count, 0, title_item)
-
-        # Add poster to the table
-        image_label = QLabel()
-        if poster_path and os.path.exists(poster_path):
-            scaled_pixmap = self.scale_poster(poster_path)
-            if scaled_pixmap:
-                image_label.setPixmap(scaled_pixmap)
-            else:
-                image_label.setText("No Image")
-        else:
-            image_label.setText("No Image")
-        image_label.setAlignment(Qt.AlignCenter)
-        target_table.setCellWidget(current_row_count, 1, image_label)
-        target_table.setRowHeight(current_row_count, 138)
-
-        # Add plot, cast, and rating
-        plot = movie_data.get("plot", "N/A")
-        rating = movie_data.get("rating", "N/A")
-        cast = movie_data.get("cast", "N/A")
-        plot_item = QTableWidgetItem(plot)
-        plot_item.setFlags(plot_item.flags() & ~Qt.ItemIsEditable)
-        plot_item.setTextAlignment(Qt.AlignCenter)
-        target_table.setItem(current_row_count, 2, plot_item)
-        cast_item = QTableWidgetItem(cast)
-        cast_item.setFlags(cast_item.flags() & ~Qt.ItemIsEditable)
-        cast_item.setTextAlignment(Qt.AlignCenter)
-        target_table.setItem(current_row_count, 3, cast_item)
-        rating_item = QTableWidgetItem(rating)
-        rating_item.setFlags(rating_item.flags() & ~Qt.ItemIsEditable)
-        rating_item.setTextAlignment(Qt.AlignCenter)
-        target_table.setItem(current_row_count, 4, rating_item)
-
-        # Update saved_movies
-        self.saved_movies[title] = {
-            "plot": plot,
-            "rating": rating,
-            "cast": cast,
-            "poster_path": poster_path,
-            "list": "To Watch List" if target_table == self.table_tab1 else "Watched List",
-        }
-        self.save_movies()
-
-        # Add to original_table_data for filtering
-        row_data = {
-            "title": title,
-            "plot": plot,
-            "rating": rating,
-            "cast": cast,
-            "pixmap": image_label.pixmap().copy() if image_label.pixmap() else None,
-        }
-        if target_table not in self.original_table_data:
-            self.original_table_data[target_table] = []
-        self.original_table_data[target_table].append(row_data)
-
-        # Update counter
-        if target_table == self.table_tab1:
-            self.update_counter(self.counter_tab1, self.table_tab1)
-        elif target_table == self.table_tab2:
-            self.update_counter(self.counter_tab2, self.table_tab2)
-
-    def add_movies_to_table_in_bulk(self, movies, target_table):
-        """Add multiple movies to a table."""
-        for movie in movies:
-            self.add_movie_to_table(
-                title=movie["title"],
-                plot=movie["plot"],
-                rating=movie["rating"],
-                poster_path=movie["poster_path"],
-                target_table=target_table,
-            )
-        target_table.update()  # Refresh the table UI once after bulk addition
-
-    def import_movies(self, target_table):
-        """Handle importing movies from a text file using threading."""
-        file_dialog = QFileDialog()
-        file_path, _ = file_dialog.getOpenFileName(self, "Select Movie List File", "", "Text Files (*.txt)")
-
-        if not file_path:
-            return  # User canceled the dialog
-
-        try:
-            with open(file_path, "r") as file:
-                movie_titles = [line.strip() for line in file if line.strip()]
-
-            if not movie_titles:
-                QMessageBox.warning(self, "No Movies Found", "The selected file contains no movie titles.")
-                return
-
-            # Start the import thread
-            self.start_import_thread(movie_titles, target_table)
-        except Exception as e:
-            QMessageBox.critical(self, "File Error", f"An error occurred while reading the file: {e}")
-
-    def start_import_thread(self, movie_titles, target_table):
-        """Start a threaded movie import with a concurrent queue."""
-        self.is_busy = True
-        self.queue = Queue()
-        for title in movie_titles:
-            self.queue.put(title)
-
-        self.import_thread = ImportMoviesThread(movie_titles, self.queue)
-        self.import_thread.movieAdded.connect(
-            lambda movie_data: self.add_movie_to_table_incrementally(movie_data, target_table)
-        )
-        self.import_thread.finished.connect(self.on_import_finished)
-        self.import_thread.start()
-        QMessageBox.information(self, "Import Started", "Movies are being imported using a queue.")
-
-    def on_import_finished(self):
-        """Handle the end of the import process."""
-        self.is_busy = False
-        self.show_popup("Import complete. You can now move or delete titles.", color="green")
-        self.save_movies()
-
-    def closeEvent(self, event):
-        """Handle application close event."""
-        # Stop the import thread
-        if self.import_thread and self.import_thread.isRunning():
-            self.import_thread.stop()
-            self.import_thread.wait()
-
-        # Clear the queue
-        if hasattr(self, 'queue') and not self.queue.empty():
-            while not self.queue.empty():
-                self.queue.get_nowait()
-            self.queue.task_done()
-
-        event.accept()
-
-    def scale_poster(self, poster_path):
-        """Scale poster images to fit within table entries."""
-        try:
-            pixmap = QPixmap(poster_path)
-            if not pixmap.isNull():
-                return pixmap.scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            else:
-                print(f"[ERROR] Pixmap is null for: {poster_path}")
-        except Exception as e:
-            print(f"[ERROR] Exception while scaling poster: {e}")
-        return None
-
-    def start_querying_movies(self, movie_titles, target_table):
-        """Start querying movies using a thread."""
-        self.import_thread = ImportMoviesThread(movie_titles, target_table)
-        self.import_thread.movieAdded.connect(lambda movie_data: self.add_movie_to_table(
-            movie_data["title"],
-            movie_data["plot"],
-            movie_data["rating"],
-            movie_data["poster_path"],
-            movie_data["cast"],
-            target_table
-        ))
-        self.import_thread.finished.connect(lambda: QMessageBox.information(self, "Import Complete", "All movies have been processed."))
-        self.import_thread.start()
-
-    def sort_table(self, table, column):
-        """Sort the table based on the clicked column with four sorting states."""
-        # Define the column-specific sorting state keys
-        sort_states = table.property("sort_states") or {0: 0, 4: 0}
-        current_state = sort_states.get(column, 0)
-
-        # Get all row data and store it in a list
-        row_data = []
-        for row in range(table.rowCount()):
-            title = table.item(row, 0).text() if table.item(row, 0) else ""
-            rating = float(table.item(row, 4).text()) if table.item(row, 4) and table.item(row, 4).text().replace('.', '', 1).isdigit() else 0.0
-            cast = table.item(row, 3).text() if table.item(row, 3) else ""
-            plot = table.item(row, 2).text() if table.item(row, 2) else ""
-            widget = table.cellWidget(row, 1)
-            pixmap = widget.pixmap() if widget and widget.pixmap() else None
-
-            # Store the row data
-            row_data.append({
-                "title": title,
-                "rating": rating,
-                "cast": cast,
-                "plot": plot,
-                "pixmap": pixmap,
-            })
-
-        # Determine sorting order based on current state
-        if column == 0:
-            if current_state == 0:
-                row_data.sort(key=lambda x: x["title"], reverse=False)  # A-Z
-            elif current_state == 1:
-                row_data.sort(key=lambda x: x["title"], reverse=True)  # Z-A
-        elif column == 4:
-            if current_state == 0:
-                row_data.sort(key=lambda x: x["rating"], reverse=True)  # Highest to Lowest
-            elif current_state == 1:
-                row_data.sort(key=lambda x: x["rating"], reverse=False)  # Lowest to Highest
-
-        # Cycle to the next state
-        sort_states[column] = (current_state + 1) % 2
-        table.setProperty("sort_states", sort_states)  # Save the updated states
-
-        # Clear and repopulate the table
-        table.setRowCount(0)
-        for row in row_data:
-            row_idx = table.rowCount()
-            table.insertRow(row_idx)
-
-            # Title
-            title_item = QTableWidgetItem(row["title"])
-            title_item.setTextAlignment(Qt.AlignCenter)
-            table.setItem(row_idx, 0, title_item)
-
-            # Poster
-            new_label = QLabel()
-            if row["pixmap"]:
-                new_label.setPixmap(row["pixmap"].scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            else:
-                new_label.setText("No Image")
-            new_label.setAlignment(Qt.AlignCenter)
-            table.setCellWidget(row_idx, 1, new_label)
-
-            # Plot
-            plot_item = QTableWidgetItem(row["plot"])
-            plot_item.setTextAlignment(Qt.AlignCenter)
-            table.setItem(row_idx, 2, plot_item)
-
-            # Cast
-            cast_item = QTableWidgetItem(row["cast"])
-            cast_item.setTextAlignment(Qt.AlignCenter)
-            table.setItem(row_idx, 3, cast_item)
-
-            # Rating
-            rating_item = QTableWidgetItem(f"{row['rating']:.1f}" if row['rating'] else "N/A")
-            rating_item.setTextAlignment(Qt.AlignCenter)
-            table.setItem(row_idx, 4, rating_item)
-
-            # Set consistent row height
-            table.setRowHeight(row_idx, 138)
-
-        # Update sort indicator for visual feedback
-        table.horizontalHeader().setSortIndicator(column, Qt.AscendingOrder if current_state == 0 else Qt.DescendingOrder)
-
-    def update_counter(self, counter_label, table):
-        """Update the counter label with the total number of rows in the table, considering original_table_data."""
-        # Check if we have original data stored for the table
-        total_rows = len(self.original_table_data.get(table, [])) if table in self.original_table_data else table.rowCount()
-        counter_label.setText(f"Titles: {total_rows}")
-
-        # Update the tab name with the total row count
-        if table == self.table_tab1:
-            self.tabs.setTabText(0, f"To Watch List ({total_rows})")
-        elif table == self.table_tab2:
-            self.tabs.setTabText(1, f"Watched List ({total_rows})")
-
-    def save_original_table_data(self, table):
-        """Save the current data of the table to original_table_data."""
-        self.original_table_data[table] = []
-        for row in range(table.rowCount()):
-            title = table.item(row, 0).text() if table.item(row, 0) else ""
-            plot = table.item(row, 2).text() if table.item(row, 2) else ""
-            cast = table.item(row, 3).text() if table.item(row, 3) else "N/A"
-            rating = table.item(row, 4).text() if table.item(row, 4) else "N/A"
-            poster_widget = table.cellWidget(row, 1)
-            pixmap = poster_widget.pixmap() if poster_widget and poster_widget.pixmap() else None
-            self.original_table_data[table].append({
-                "title": title,
-                "plot": plot,
-                "cast": cast,
-                "rating": rating,
-                "pixmap": pixmap.copy() if pixmap else None,
-            })
-
-    def restore_original_table_data(self, table):
-        """Restore the table data from original_table_data."""
-        if table in self.original_table_data:
-            table.setRowCount(0)
-            for row_data in self.original_table_data[table]:
-                self.add_filtered_row(table, row_data)
-
-    def add_filtered_row(self, table, row_data):
-        try:
-            row_idx = table.rowCount()
-            table.insertRow(row_idx)
-
-            # Title
-            title_item = QTableWidgetItem(row_data.get("title", ""))
-            title_item.setTextAlignment(Qt.AlignCenter)
-            table.setItem(row_idx, 0, title_item)
-
-            # Poster
-            new_label = QLabel()
-            pixmap = row_data.get("pixmap", None)
-            if pixmap and not pixmap.isNull():
-                new_label.setPixmap(pixmap.scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            else:
-                new_label.setText("No Image")
-            new_label.setAlignment(Qt.AlignCenter)
-            table.setCellWidget(row_idx, 1, new_label)
-
-            # Plot
-            plot_item = QTableWidgetItem(row_data.get("plot", "N/A"))
-            plot_item.setTextAlignment(Qt.AlignCenter)
-            table.setItem(row_idx, 2, plot_item)
-
-            # Cast
-            cast_item = QTableWidgetItem(row_data.get("cast", "N/A"))
-            cast_item.setTextAlignment(Qt.AlignCenter)
-            table.setItem(row_idx, 3, cast_item)
-
-            # Rating
-            rating_item = QTableWidgetItem(row_data.get("rating", "N/A"))
-            rating_item.setTextAlignment(Qt.AlignCenter)
-            table.setItem(row_idx, 4, rating_item)
-
-            table.setRowHeight(row_idx, 138)
-        except Exception as e:
-            print("Error while adding filtered row:", str(e))
-
-    def filter_table_rows(self, table, filter_text):
-        """Filter rows in the table by title or cast."""
-        filter_text = filter_text.strip().lower()
-        if not filter_text:
-            self.restore_original_table_data(table)
-            return
-
-        if table not in self.original_table_data or not self.original_table_data[table]:
-            self.save_original_table_data(table)
-
-        table.setRowCount(0)
-        for row_data in self.original_table_data[table]:
-            title = row_data.get("title", "").lower()
-            cast = row_data.get("cast", "N/A").lower()
-            print(f"[DEBUG] Filtering row - Title: {title}, Cast: {cast}")
-
-            if filter_text in title or filter_text in cast:
-                self.add_filtered_row(table, row_data)
-
-    def update_table_with_filtered_data(self, table, filtered_data):
-        """Update the table with filtered rows."""
-        table.setRowCount(0)
-        for row_data in filtered_data:
-            self.add_filtered_row(table, row_data)
-
-    def compute_similarity(input_text, suggestion_title):
-        input_text = input_text.lower()
-        suggestion_title = suggestion_title.lower()
-
-        # Exact match
-        if input_text == suggestion_title:
-            return 1.0
-
-        # Partial match
-        shared_characters = sum(1 for c in input_text if c in suggestion_title)
-        return shared_characters / max(len(suggestion_title), len(input_text))
-
-    def on_focus_changed(self, old_widget, new_widget):
-        """Handle focus changes in the application."""
-        if new_widget in [self.text_entry_tab1, self.text_entry_tab2]:
-            # Show the relevant suggestion list if the new widget is a text entry
-            if new_widget == self.text_entry_tab1 and self.suggestion_list_tab1.count() > 0:
-                self.suggestion_list_tab1.show()
-            elif new_widget == self.text_entry_tab2 and self.suggestion_list_tab2.count() > 0:
-                self.suggestion_list_tab2.show()
-        else:
-            # Hide both suggestion lists if focus is elsewhere
-            self.suggestion_list_tab1.hide()
-            self.suggestion_list_tab2.hide()
-
-    def populate_table(self):
-        """Populate the table with initial data."""
-        data = []
-        for row_idx, row_data in enumerate(data):
-            for col_idx, value in enumerate(row_data):
-                item = QTableWidgetItem(value)
-                item.setTextAlignment(Qt.AlignCenter)
-                self.table.setItem(row_idx, col_idx, item)
-
-    def populate_table_with_saved_data(self):
-        """Populate the tables with saved movies and posters from saved data."""
-        to_watch_movies = []
-        watched_movies = []
-
-        # Separate movies by their target table
-        for title, data in self.saved_movies.items():
-            movie_data = {
-                "title": title,
-                "plot": data.get("plot", ""),
-                "rating": data.get("rating", ""),
-                "poster_path": data.get("poster_path", ""),
+        # Add Switch API Keys button
+        switch_api_keys_button = QPushButton("Switch API Keys")
+        switch_api_keys_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
             }
-            if data.get("list") == "To Watch List":
-                to_watch_movies.append(movie_data)
-            else:
-                watched_movies.append(movie_data)
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        switch_api_keys_button.clicked.connect(self.open_revalidate_dialog)
+        layout.addWidget(switch_api_keys_button, 0, 0, 1, 3)
 
-        # Add movies in bulk to the tables
-        self.add_movies_to_table_in_bulk(to_watch_movies, self.table_tab1)
-        self.add_movies_to_table_in_bulk(watched_movies, self.table_tab2)
+        # Add Move Data Directory button
+        move_data_dir_button = QPushButton("Move Data Directory")
+        move_data_dir_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        move_data_dir_button.clicked.connect(self.move_data_directory)
+        layout.addWidget(move_data_dir_button, 1, 0, 1, 3)
+
+        # Add Max Suggestions entry and Save button in the next row
+        max_suggestions_label = QLabel("Maximum Suggestions:")
+        max_suggestions_label.setStyleSheet("color: white;")
+        layout.addWidget(max_suggestions_label, 3, 0)  # Adjusted to row 3
+
+        max_suggestions_entry = QLineEdit(str(max_suggestions))
+        max_suggestions_entry.setValidator(QIntValidator(1, 100))
+        layout.addWidget(max_suggestions_entry, 3, 1)  # Adjusted to row 3
+
+        save_button = QPushButton("Save")
+        save_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #45A049;
+            }
+        """)
+        save_button.clicked.connect(lambda: self.save_settings(max_suggestions_entry.text(), settings_window))
+        layout.addWidget(save_button, 3, 2)  # Adjusted to row 3
+
+        # Add an empty row
+        empty_widget1 = QWidget()  # This will be an empty row
+        layout.addWidget(empty_widget1, 4, 0)
+
+        # Add another empty row if needed
+        empty_widget2 = QWidget()  # Another empty row
+        layout.addWidget(empty_widget2, 5, 0)
+
+        settings_window.setLayout(layout)
+        settings_window.exec_()
+
+    def center_window(self):
+            """Center the main window on the screen."""
+            screen_geometry = QApplication.desktop().screenGeometry()
+            window_geometry = self.frameGeometry()
+            center_point = screen_geometry.center()
+            window_geometry.moveCenter(center_point)
+            self.move(window_geometry.topLeft())
 
     def showEvent(self, event):
         """Trigger the resizeEvent explicitly when the window is shown."""
@@ -2267,13 +1565,69 @@ class MovieApp(QWidget):
         elif active_tab_index == 1:  # Tab 2
             self.position_suggestion_list(self.text_entry_tab2, self.suggestion_list_tab2)
 
-    def is_duplicate(self, title_with_year, table):
-        """Check if a title with the year already exists in the given table."""
-        for row in range(table.rowCount()):
-            existing_title = table.item(row, 0)  # Column 0 contains titles
-            if existing_title and existing_title.text().strip().lower() == title_with_year.strip().lower():
-                return True
-        return False
+    def highlight_row(self, row):
+        """Highlight the entire row in orange."""
+        for column in range(self.table.columnCount()):
+            item = self.table.item(row, column)
+            if item:
+                item.setBackground(QColor("#FFA500"))
+
+    # -----------------------------------
+    # User Interaction Management
+    # -----------------------------------
+    def enable_user_interaction(self):
+        """Re-enable search, filter, and table interactions."""
+        self.text_entry_tab1.setEnabled(True)
+        self.text_entry_tab2.setEnabled(True)
+        self.filter_entry_tab1.setEnabled(True)
+        self.filter_entry_tab2.setEnabled(True)
+        self.table_tab1.setEnabled(True)
+        self.table_tab2.setEnabled(True)
+        self.import_button_tab1.setEnabled(True)
+        self.import_button_tab2.setEnabled(True)
+
+    def disable_user_interaction(self):
+        """Disable search, filter, and table interactions."""
+        self.text_entry_tab1.setEnabled(False)
+        self.text_entry_tab2.setEnabled(False)
+        self.filter_entry_tab1.setEnabled(False)
+        self.filter_entry_tab2.setEnabled(False)
+        self.table_tab1.setEnabled(False)
+        self.table_tab2.setEnabled(False)
+        self.import_button_tab1.setEnabled(False)
+        self.import_button_tab2.setEnabled(False)
+    
+    def on_focus_changed(self, old_widget, new_widget):
+        """Handle focus changes in the application."""
+        if new_widget in [self.text_entry_tab1, self.text_entry_tab2]:
+            # Show the relevant suggestion list if the new widget is a text entry
+            if new_widget == self.text_entry_tab1 and self.suggestion_list_tab1.count() > 0:
+                self.suggestion_list_tab1.show()
+            elif new_widget == self.text_entry_tab2 and self.suggestion_list_tab2.count() > 0:
+                self.suggestion_list_tab2.show()
+        else:
+            # Hide both suggestion lists if focus is elsewhere
+            self.suggestion_list_tab1.hide()
+            self.suggestion_list_tab2.hide()
+
+    def mousePressEvent(self, event):
+        """Handle mouse clicks anywhere in the main widget."""
+        if not (self.text_entry_tab1.geometry().contains(event.pos()) or 
+                self.text_entry_tab2.geometry().contains(event.pos())):
+            # Clear focus from both text entry boxes
+            self.text_entry_tab1.clearFocus()
+            self.text_entry_tab2.clearFocus()
+            # Hide suggestion lists if not focused
+            self.suggestion_list_tab1.hide()
+            self.suggestion_list_tab2.hide()
+
+        super().mousePressEvent(event)
+
+    def keyPressEvent(self, event):
+        """Handle key press events."""
+        if event.key() == Qt.Key_Backslash:  # Check for the "\" key
+            self.show_popup("This is a test popup!", color="blue")
+        super().keyPressEvent(event)  # Call the parent class method for other key events
 
     def show_context_menu(self, position):
         """Show context menu on right-click."""
@@ -2312,262 +1666,20 @@ class MovieApp(QWidget):
             elif action == move_action:
                 self.move_entry_to_other_tab(row, current_table, target_table)
 
-    def highlight_row(self, row):
-        """Highlight the entire row in orange."""
-        for column in range(self.table.columnCount()):
-            item = self.table.item(row, column)
-            if item:
-                item.setBackground(QColor("#FFA500"))
+    # -----------------------------------
+    # Tab Switching
+    # -----------------------------------
+    def next_sheet(self):
+        """Move to the next sheet (tab) dynamically."""
+        current_index = self.tabs.currentIndex()
+        next_index = (current_index + 1) % self.tabs.count()  # Wrap around to the first tab
+        self.tabs.setCurrentIndex(next_index)
 
-    def move_entry_to_other_tab(self, row, current_table, target_table):
-        """Move a row from one table to the other and update original_table_data."""
-        # Extract data from the current table
-        title = current_table.item(row, 0).text()
-        plot = current_table.item(row, 2).text()
-        cast = current_table.item(row, 3).text()
-        rating = current_table.item(row, 4).text()
-        poster_widget = current_table.cellWidget(row, 1)
-        pixmap = poster_widget.pixmap() if poster_widget and poster_widget.pixmap() else None
-
-        # Add the row to the target table
-        target_row = target_table.rowCount()
-        target_table.insertRow(target_row)
-
-        # Title
-        title_item = QTableWidgetItem(title)
-        title_item.setTextAlignment(Qt.AlignCenter)
-        target_table.setItem(target_row, 0, title_item)
-
-        # Poster
-        image_label = QLabel()
-        if pixmap:
-            scaled_pixmap = pixmap.scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            image_label.setPixmap(scaled_pixmap)
-        else:
-            image_label.setText("No Image")
-        image_label.setAlignment(Qt.AlignCenter)
-        target_table.setCellWidget(target_row, 1, image_label)
-        target_table.setRowHeight(target_row, 138)
-
-        # Plot
-        plot_item = QTableWidgetItem(plot)
-        plot_item.setTextAlignment(Qt.AlignCenter)
-        target_table.setItem(target_row, 2, plot_item)
-
-        # Cast
-        cast_item = QTableWidgetItem(cast)
-        cast_item.setTextAlignment(Qt.AlignCenter)
-        target_table.setItem(target_row, 3, cast_item)
-
-        # Rating
-        rating_item = QTableWidgetItem(rating)
-        rating_item.setTextAlignment(Qt.AlignCenter)
-        target_table.setItem(target_row, 4, rating_item)
-
-        # Update saved_movies
-        if title in self.saved_movies:
-            self.saved_movies[title]["list"] = (
-                "To Watch List" if target_table == self.table_tab1 else "Watched List"
-            )
-            self.save_movies()
-
-        # Update original_table_data
-        if current_table in self.original_table_data:
-            # Remove from current_table's original_table_data
-            for idx, row_data in enumerate(self.original_table_data[current_table]):
-                if row_data.get("title") == title:
-                    # Move to target_table's original_table_data
-                    if target_table not in self.original_table_data:
-                        self.original_table_data[target_table] = []
-                    self.original_table_data[target_table].append(row_data)
-                    del self.original_table_data[current_table][idx]
-                    break
-
-        # Remove the row from the current table
-        current_table.removeRow(row)
-
-        # Update counters
-        self.update_counter(
-            self.counter_tab1 if current_table == self.table_tab1 else self.counter_tab2, current_table
-        )
-        self.update_counter(
-            self.counter_tab1 if target_table == self.table_tab1 else self.counter_tab2, target_table
-        )
-
-    def on_text_changed(self, text, text_entry, suggestion_list):
-        text = text.strip()
-        
-        # Reset suggestions_active and handle a new query
-        self.suggestions_active = True
-
-        if len(text) >= 1: # Literally not needed, but I'm lazy :)
-            # Cancel ongoing suggestion thread
-            if self.suggestion_thread and self.suggestion_thread.isRunning():
-                self.suggestion_thread.stop()
-                self.suggestion_thread.wait()
-                self.suggestion_thread = None
-
-            # Start a timer to fetch suggestions after user stops typing
-            self.timer_tab1.timeout.disconnect()  # Disconnect any previous connections
-            self.timer_tab1.timeout.connect(lambda: self.fetch_suggestions(text_entry, suggestion_list))
-            self.timer_tab1.start(800)  # Start 800ms delay after typing
-        else:
-            # Hide the suggestion list if input is too short
-            suggestion_list.hide()
-
-    def fetch_suggestions(self, text_entry, suggestion_list):
-        text = text_entry.text().strip()
-        if not text or not self.suggestions_active:
-            print("[DEBUG] No text entered or suggestions disabled. Skipping fetch suggestions.")
-            return
-
-        # Mark query as in progress
-        self.query_in_progress = True
-
-        # Clear the suggestion list and current suggestions before fetching new suggestions
-        suggestion_list.clear()
-        self.current_suggestions = []
-
-        # Stop any running thread
-        if self.suggestion_thread is not None and self.suggestion_thread.isRunning():
-            self.suggestion_thread.stop()
-            self.suggestion_thread.wait()
-
-        # Start a new suggestion thread
-        self.suggestion_thread = FetchSuggestionsThread(text=text)
-        self.suggestion_thread.suggestionsFetched.connect(
-            lambda suggestion: self.add_unique_suggestion_to_list(suggestion, suggestion_list)
-        )
-        self.suggestion_thread.finished.connect(self.cleanup_suggestion_thread)
-
-        self.suggestion_thread.start()
-        print("[DEBUG] FetchSuggestionsThread started.")
-
-    def add_suggestion_to_list(self, suggestion, suggestion_list):
-        """Dynamically add suggestions to the suggestion list."""
-        if not suggestion:
-            print("[ERROR] Empty suggestion passed.")
-            return
-
-        # Validate fields
-        title = suggestion.get("title", "Unknown Title")
-        year = suggestion.get("year", "Unknown Year")
-        poster_url = suggestion.get("poster_url", "")
-        actors = suggestion.get("actors", "N/A")
-
-        # Add to current_suggestions for later matching
-        self.current_suggestions.append(suggestion)
-        print(f"[DEBUG] Adding suggestion: {suggestion}")
-
-        # Create the list item
-        item_widget = self.create_suggestion_item(title, year, poster_url, actors)
-        item = QListWidgetItem(suggestion_list)
-        item.setSizeHint(item_widget.sizeHint())
-        suggestion_list.addItem(item)
-        suggestion_list.setItemWidget(item, item_widget)
-
-        # Show the suggestion list
-        if not suggestion_list.isVisible():
-            suggestion_list.show()
-
-    def update_suggestions(self, suggestions, suggestion_list, text_entry):
-        print(f"[DEBUG] Received suggestions: {suggestions}")
-        if not suggestions:
-            print("[DEBUG] No suggestions to show.")
-            suggestion_list.hide()
-            return
-
-        suggestion_list.clear()
-
-        self.current_suggestions = suggestions[:max_suggestions]
-
-        # Debugging: Show the raw order from GPT
-        print(f"[DEBUG] GPT-sorted suggestions: {[s['title'] for s in self.current_suggestions]}")
-
-        # Add suggestions to the suggestion list in the same order as GPT provided
-        for suggestion in self.current_suggestions:
-            self.add_suggestion_to_list(suggestion, suggestion_list)
-
-        # Ensure the suggestion list is properly displayed
-        print(f"[DEBUG] Suggestion list height before setting: {suggestion_list.height()}")
-        suggestion_list.setFixedHeight(800)
-        print(f"[DEBUG] Suggestion list height after setting: {suggestion_list.height()}")
-        self.position_suggestion_list(text_entry, suggestion_list)
-        suggestion_list.show()
-
-    def create_suggestion_item(self, title, year, poster_url, actors):
-        """Create a suggestion list item."""
-        widget = QWidget()
-        layout = QHBoxLayout()
-
-        # Add poster image
-        image_label = QLabel()
-        image_label.setFixedSize(92, 138)
-        if poster_url and poster_url != "N/A":
-            try:
-                pixmap = QPixmap()
-                pixmap.loadFromData(requests.get(poster_url).content)
-                image_label.setPixmap(
-                    pixmap.scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                )
-            except Exception as e:
-                print(f"[ERROR] Failed to load poster: {e}")
-                image_label.setText("No Image")
-        else:
-            image_label.setText("No Image")
-        layout.addWidget(image_label)
-
-        # Add movie details
-        title_label = QLabel(f"{title} ({year})")
-        title_label.setStyleSheet("color: white;")
-        title_label.setWordWrap(True)
-
-        actors_label = QLabel(f"Actors: {actors}")
-        actors_label.setStyleSheet("color: gray; font-size: 12px;")
-        actors_label.setWordWrap(True)
-
-        text_layout = QVBoxLayout()
-        text_layout.addWidget(title_label)
-        text_layout.addWidget(actors_label)
-
-        layout.addLayout(text_layout)
-        widget.setLayout(layout)
-        return widget
-
-    def add_unique_suggestion_to_list(self, suggestion, suggestion_list):
-        """Add suggestions to the list while ensuring uniqueness."""
-        if not self.suggestions_active or not self.query_in_progress:
-            print("[DEBUG] Suggestions fetching disabled. Ignoring suggestion.")
-            return
-
-        # Check for duplicates
-        existing_titles = {(s["title"].strip().lower(), s["year"].strip()) for s in self.current_suggestions}
-        title_key = (suggestion["title"].strip().lower(), suggestion["year"].strip())
-
-        if title_key in existing_titles:
-            print(f"[DEBUG] Duplicate suggestion ignored: {suggestion}")
-            return
-
-        # Respect max_suggestions (excluding the OMDb suggestion)
-        if len(self.current_suggestions) >= max_suggestions + 1:  # +1 for the OMDb suggestion
-            print(f"[DEBUG] Max suggestions reached. Ignoring suggestion: {suggestion}")
-            return
-
-        # Add suggestion to the current list
-        self.current_suggestions.append(suggestion)
-        print(f"[DEBUG] Added to current_suggestions: {suggestion}")
-
-        # Add to the suggestion list UI
-        item_widget = self.create_suggestion_item(
-            suggestion["title"], suggestion["year"], suggestion["poster_url"], suggestion["actors"]
-        )
-        item = QListWidgetItem(suggestion_list)
-        item.setSizeHint(item_widget.sizeHint())
-        suggestion_list.addItem(item)
-        suggestion_list.setItemWidget(item, item_widget)
-
-        if not suggestion_list.isVisible():
-            suggestion_list.show()
+    def previous_sheet(self):
+        """Move to the previous sheet (tab) dynamically."""
+        current_index = self.tabs.currentIndex()
+        previous_index = (current_index - 1) % self.tabs.count()  # Wrap around to the last tab
+        self.tabs.setCurrentIndex(previous_index)
 
     def hide_all_suggestion_lists(self):
         """Hide both suggestion lists and update the active tab's suggestion list."""
@@ -2584,106 +1696,178 @@ class MovieApp(QWidget):
         elif active_tab_index == 1:  # Tab 2
             self.position_suggestion_list(self.text_entry_tab2, self.suggestion_list_tab2)
 
-    def load_image_async(self, label, url):
-        """Load image asynchronously."""
-        thread = ImageLoaderThread(label, url)
-        thread.imageLoaded.connect(self.set_image)
-        thread.finished.connect(lambda: self.image_threads.remove(thread))
-        self.image_threads.append(thread)
-        thread.start()
+    def move_data_directory(self):
+        """Allow the user to move the saved_data directory to a new location."""
+        print("[DEBUG] User initiated move of the saved_data directory.")
+        
+        # Create a custom dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Move Save Directory")
+        dialog.setStyleSheet("background-color: #1C1C1C; color: white;")
+        layout = QVBoxLayout(dialog)
 
-    def set_image(self, label, pixmap):
-        """Set the loaded image on the label with proper scaling."""
-        if pixmap and not pixmap.isNull():
-            scaled_pixmap = pixmap.scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            label.setPixmap(scaled_pixmap)
-        else:
-            label.setText("No Image")
+        # Add instructions
+        instructions = QLabel(
+            "Would you like to open an existing save directory or create a new one?"
+        )
+        instructions.setWordWrap(True)
+        instructions.setAlignment(Qt.AlignCenter)  # Center align the text
+        instructions.setStyleSheet("color: white; font-size: 14px;")
+        layout.addWidget(instructions)
 
-    def cleanup_suggestion_thread(self):
-        """Cleanup suggestion thread."""
-        self.suggestion_thread = None
+        # Add buttons for choices
+        open_button = QPushButton("Open Existing Directory")
+        open_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        layout.addWidget(open_button)
 
-    def position_suggestion_list(self, text_entry, suggestion_list):
-        """Position the suggestion list directly below the given text entry."""
-        print("[DEBUG] Positioning suggestion list.")
-        text_entry_global_pos = text_entry.mapToGlobal(QPoint(0, text_entry.height()))
-        suggestion_list.move(text_entry_global_pos)
-        suggestion_list.setFixedWidth(text_entry.width())
-        print(f"[DEBUG] Suggestion list positioned at: {text_entry_global_pos}")
+        create_button = QPushButton("Create New Directory")
+        create_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        layout.addWidget(create_button)
 
-    def cleanup_thread(self):
-        """Cleanup the thread after it finishes."""
-        self.thread = None
+        # Cancel button
+        cancel_button = QPushButton("Cancel")
+        cancel_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2E2E2E;
+                color: white;
+                border: 1px solid white;
+                border-radius: 5px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4E4E4E;
+            }
+            QPushButton:pressed {
+                background-color: #1E1E1E;
+            }
+        """)
+        layout.addWidget(cancel_button)
 
-    def select_suggestion(self, item, suggestion_list):
-        """Handle the selection of a suggestion."""
-        # Disable further querying temporarily
-        self.suggestions_active = False
+        def handle_open():
+            dir_dialog = QFileDialog()
+            dir_path = dir_dialog.getExistingDirectory(dialog, "Select Existing Directory for MoviesList")
+            if dir_path:
+                self.move_to_selected_directory(dir_path)
+                dialog.accept()
+            else:
+                QMessageBox.warning(dialog, "Invalid Directory", "You must select a directory.")
 
-        # Stop any ongoing suggestion thread
-        if self.suggestion_thread is not None and self.suggestion_thread.isRunning():
-            self.suggestion_thread.stop()
-            self.suggestion_thread.wait()
+        def handle_create():
+            dir_dialog = QFileDialog()
+            dir_path = dir_dialog.getExistingDirectory(dialog, "Select Parent Directory for New MoviesList")
+            if dir_path:
+                new_movies_list_path = os.path.join(dir_path, "MoviesList")
+                os.makedirs(new_movies_list_path, exist_ok=True)
+                self.move_to_selected_directory(new_movies_list_path)
+                dialog.accept()
+            else:
+                QMessageBox.warning(dialog, "Invalid Directory", "You must select a directory.")
 
-        active_tab_index = self.tabs.currentIndex()
-        table = self.table_tab1 if active_tab_index == 0 else self.table_tab2
-        text_entry = self.text_entry_tab1 if active_tab_index == 0 else self.text_entry_tab2
+        def handle_cancel():
+            dialog.reject()
 
-        widget = suggestion_list.itemWidget(item)
-        if widget:
-            layout = widget.layout()
-            title_label = None
-            for i in range(layout.count()):
-                child_layout = layout.itemAt(i)
-                if isinstance(child_layout, QVBoxLayout):
-                    for j in range(child_layout.count()):
-                        child = child_layout.itemAt(j).widget()
-                        if isinstance(child, QLabel) and "(" in child.text():
-                            title_label = child
-                            break
-                    if title_label:
-                        break
+        open_button.clicked.connect(handle_open)
+        create_button.clicked.connect(handle_create)
+        cancel_button.clicked.connect(handle_cancel)
 
-            if title_label:
-                suggestion_text = title_label.text().strip()
-                match = re.match(r"(.+?)\s\((\d{4}(?:–\d{4}|–)?)\)", suggestion_text)
-                if match:
-                    title = match.group(1).strip()
-                    year = match.group(2).strip()
+        dialog.exec_()
 
-                    # Handle multi-year formats correctly
-                    title_with_year = f"{title} [{year}]"
+    def move_to_selected_directory(self, new_dir_path):
+        """Move the save data to the selected directory."""
+        try:
+            old_dir_path = MovieApp.SAVE_DIR
 
-                    # Add the selected suggestion to the table
-                    self.add_movie_to_table(
-                        title=title_with_year,
-                        plot=None,
-                        rating=None,
-                        poster_path=None,
-                        cast=None,
-                        target_table=table,
-                    )
+            # Move files to the new directory
+            for item in os.listdir(old_dir_path):
+                old_item_path = os.path.join(old_dir_path, item)
+                new_item_path = os.path.join(new_dir_path, item)
+                if os.path.isdir(old_item_path):
+                    os.rename(old_item_path, new_item_path)
+                else:
+                    os.replace(old_item_path, new_item_path)
 
-        suggestion_list.hide()
-        text_entry.clear()
+            print(f"[DEBUG] Data moved successfully from {old_dir_path} to {new_dir_path}.")
 
-        # Reactivate suggestions after selection
-        self.suggestions_active = True
+            # Update the config file
+            config = configparser.ConfigParser()
+            config.read(CONFIG_FILE)
+            config['Settings']['saved_data_dir'] = new_dir_path
+            with open(CONFIG_FILE, 'w') as configfile:
+                config.write(configfile)
+            print(f"[DEBUG] Updated config.ini with new directory: {new_dir_path}")
 
-    def closeEvent(self, event):
-        """Handle window close event."""
-        # Stop suggestion thread
-        if self.suggestion_thread is not None and self.suggestion_thread.isRunning():
-            self.suggestion_thread.stop()
-            self.suggestion_thread.wait()
+            # Delete the old directory
+            os.rmdir(old_dir_path)
+            print(f"[DEBUG] Deleted old directory: {old_dir_path}")
 
-        # Stop all image threads
-        for thread in self.image_threads:
-            thread.terminate()
-        self.image_threads.clear()
+            # Update the application state
+            MovieApp.SAVE_DIR = new_dir_path
+            self.show_popup("Save directory moved successfully.", color="green")
+        except Exception as e:
+            print(f"[ERROR] Failed to move save directory: {e}")
+            QMessageBox.critical(self, "Move Failed", f"An error occurred while moving the directory:\n{e}")
 
-        event.accept()
+    # -----------------------------------
+    # Table Management
+    # -----------------------------------
+    def populate_table(self):
+        """Populate the table with initial data."""
+        data = []
+        for row_idx, row_data in enumerate(data):
+            for col_idx, value in enumerate(row_data):
+                item = QTableWidgetItem(value)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row_idx, col_idx, item)
+
+    def populate_table_with_saved_data(self):
+        """Populate the tables with saved movies and posters from saved data."""
+        to_watch_movies = []
+        watched_movies = []
+
+        # Separate movies by their target table
+        for title, data in self.saved_movies.items():
+            movie_data = {
+                "title": title,
+                "plot": data.get("plot", ""),
+                "rating": data.get("rating", ""),
+                "poster_path": data.get("poster_path", ""),
+            }
+            if data.get("list") == "To Watch List":
+                to_watch_movies.append(movie_data)
+            else:
+                watched_movies.append(movie_data)
+
+        # Add movies in bulk to the tables
+        self.add_movies_to_table_in_bulk(to_watch_movies, self.table_tab1)
+        self.add_movies_to_table_in_bulk(watched_movies, self.table_tab2)
 
     def add_movie_to_table(self, title, plot=None, rating=None, poster_path=None, cast=None, target_table=None):
         print(f"[DEBUG] Starting to add movie: '{title}'")
@@ -2795,6 +1979,175 @@ class MovieApp(QWidget):
         elif target_table == self.table_tab2:
             self.update_counter(self.counter_tab2, self.table_tab2)
 
+    def add_movie_to_table_incrementally(self, movie_data, target_table):
+        """Add movies to the specified table incrementally and check for poster."""
+        current_row_count = target_table.rowCount()
+        target_table.insertRow(current_row_count)
+
+        # Check if the poster exists, otherwise fetch it
+        title = movie_data.get("title", "Unknown Title")
+        poster_path = movie_data.get("poster_path", "")
+        poster_path = self.get_or_download_poster(poster_path, title)
+
+        # Add title to the table
+        title_item = QTableWidgetItem(title)
+        title_item.setFlags(title_item.flags() & ~Qt.ItemIsEditable)
+        title_item.setTextAlignment(Qt.AlignCenter)
+        target_table.setItem(current_row_count, 0, title_item)
+
+        # Add poster to the table
+        image_label = QLabel()
+        if poster_path and os.path.exists(poster_path):
+            scaled_pixmap = self.scale_poster(poster_path)
+            if scaled_pixmap:
+                image_label.setPixmap(scaled_pixmap)
+            else:
+                image_label.setText("No Image")
+        else:
+            image_label.setText("No Image")
+        image_label.setAlignment(Qt.AlignCenter)
+        target_table.setCellWidget(current_row_count, 1, image_label)
+        target_table.setRowHeight(current_row_count, 138)
+
+        # Add plot, cast, and rating
+        plot = movie_data.get("plot", "N/A")
+        rating = movie_data.get("rating", "N/A")
+        cast = movie_data.get("cast", "N/A")
+        plot_item = QTableWidgetItem(plot)
+        plot_item.setFlags(plot_item.flags() & ~Qt.ItemIsEditable)
+        plot_item.setTextAlignment(Qt.AlignCenter)
+        target_table.setItem(current_row_count, 2, plot_item)
+        cast_item = QTableWidgetItem(cast)
+        cast_item.setFlags(cast_item.flags() & ~Qt.ItemIsEditable)
+        cast_item.setTextAlignment(Qt.AlignCenter)
+        target_table.setItem(current_row_count, 3, cast_item)
+        rating_item = QTableWidgetItem(rating)
+        rating_item.setFlags(rating_item.flags() & ~Qt.ItemIsEditable)
+        rating_item.setTextAlignment(Qt.AlignCenter)
+        target_table.setItem(current_row_count, 4, rating_item)
+
+        # Update saved_movies
+        self.saved_movies[title] = {
+            "plot": plot,
+            "rating": rating,
+            "cast": cast,
+            "poster_path": poster_path,
+            "list": "To Watch List" if target_table == self.table_tab1 else "Watched List",
+        }
+        self.save_movies()
+
+        # Add to original_table_data for filtering
+        row_data = {
+            "title": title,
+            "plot": plot,
+            "rating": rating,
+            "cast": cast,
+            "pixmap": image_label.pixmap().copy() if image_label.pixmap() else None,
+        }
+        if target_table not in self.original_table_data:
+            self.original_table_data[target_table] = []
+        self.original_table_data[target_table].append(row_data)
+
+        # Update counter
+        if target_table == self.table_tab1:
+            self.update_counter(self.counter_tab1, self.table_tab1)
+        elif target_table == self.table_tab2:
+            self.update_counter(self.counter_tab2, self.table_tab2)
+
+    def add_movies_to_table_in_bulk(self, movies, target_table):
+        """Add multiple movies to a table."""
+        for movie in movies:
+            self.add_movie_to_table(
+                title=movie["title"],
+                plot=movie["plot"],
+                rating=movie["rating"],
+                poster_path=movie["poster_path"],
+                target_table=target_table,
+            )
+        target_table.update()  # Refresh the table UI once after bulk addition
+
+    def sort_table(self, table, column):
+        """Sort the table based on the clicked column with four sorting states."""
+        # Define the column-specific sorting state keys
+        sort_states = table.property("sort_states") or {0: 0, 4: 0}
+        current_state = sort_states.get(column, 0)
+
+        # Get all row data and store it in a list
+        row_data = []
+        for row in range(table.rowCount()):
+            title = table.item(row, 0).text() if table.item(row, 0) else ""
+            rating = float(table.item(row, 4).text()) if table.item(row, 4) and table.item(row, 4).text().replace('.', '', 1).isdigit() else 0.0
+            cast = table.item(row, 3).text() if table.item(row, 3) else ""
+            plot = table.item(row, 2).text() if table.item(row, 2) else ""
+            widget = table.cellWidget(row, 1)
+            pixmap = widget.pixmap() if widget and widget.pixmap() else None
+
+            # Store the row data
+            row_data.append({
+                "title": title,
+                "rating": rating,
+                "cast": cast,
+                "plot": plot,
+                "pixmap": pixmap,
+            })
+
+        # Determine sorting order based on current state
+        if column == 0:
+            if current_state == 0:
+                row_data.sort(key=lambda x: x["title"], reverse=False)  # A-Z
+            elif current_state == 1:
+                row_data.sort(key=lambda x: x["title"], reverse=True)  # Z-A
+        elif column == 4:
+            if current_state == 0:
+                row_data.sort(key=lambda x: x["rating"], reverse=True)  # Highest to Lowest
+            elif current_state == 1:
+                row_data.sort(key=lambda x: x["rating"], reverse=False)  # Lowest to Highest
+
+        # Cycle to the next state
+        sort_states[column] = (current_state + 1) % 2
+        table.setProperty("sort_states", sort_states)  # Save the updated states
+
+        # Clear and repopulate the table
+        table.setRowCount(0)
+        for row in row_data:
+            row_idx = table.rowCount()
+            table.insertRow(row_idx)
+
+            # Title
+            title_item = QTableWidgetItem(row["title"])
+            title_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row_idx, 0, title_item)
+
+            # Poster
+            new_label = QLabel()
+            if row["pixmap"]:
+                new_label.setPixmap(row["pixmap"].scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                new_label.setText("No Image")
+            new_label.setAlignment(Qt.AlignCenter)
+            table.setCellWidget(row_idx, 1, new_label)
+
+            # Plot
+            plot_item = QTableWidgetItem(row["plot"])
+            plot_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row_idx, 2, plot_item)
+
+            # Cast
+            cast_item = QTableWidgetItem(row["cast"])
+            cast_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row_idx, 3, cast_item)
+
+            # Rating
+            rating_item = QTableWidgetItem(f"{row['rating']:.1f}" if row['rating'] else "N/A")
+            rating_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row_idx, 4, rating_item)
+
+            # Set consistent row height
+            table.setRowHeight(row_idx, 138)
+
+        # Update sort indicator for visual feedback
+        table.horizontalHeader().setSortIndicator(column, Qt.AscendingOrder if current_state == 0 else Qt.DescendingOrder)
+
     def delete_movie_data(self, title, current_table):
         """Delete movie data, including removing from saved_movies and poster."""
         print(f"[DEBUG] Attempting to delete movie: {title}")
@@ -2840,6 +2193,466 @@ class MovieApp(QWidget):
         elif current_table == self.table_tab2:
             self.update_counter(self.counter_tab2, self.table_tab2)
 
+    def move_entry_to_other_tab(self, row, current_table, target_table):
+        """Move a row from one table to the other and update original_table_data."""
+        # Extract data from the current table
+        title = current_table.item(row, 0).text()
+        plot = current_table.item(row, 2).text()
+        cast = current_table.item(row, 3).text()
+        rating = current_table.item(row, 4).text()
+        poster_widget = current_table.cellWidget(row, 1)
+        pixmap = poster_widget.pixmap() if poster_widget and poster_widget.pixmap() else None
+
+        # Add the row to the target table
+        target_row = target_table.rowCount()
+        target_table.insertRow(target_row)
+
+        # Title
+        title_item = QTableWidgetItem(title)
+        title_item.setTextAlignment(Qt.AlignCenter)
+        target_table.setItem(target_row, 0, title_item)
+
+        # Poster
+        image_label = QLabel()
+        if pixmap:
+            scaled_pixmap = pixmap.scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            image_label.setPixmap(scaled_pixmap)
+        else:
+            image_label.setText("No Image")
+        image_label.setAlignment(Qt.AlignCenter)
+        target_table.setCellWidget(target_row, 1, image_label)
+        target_table.setRowHeight(target_row, 138)
+
+        # Plot
+        plot_item = QTableWidgetItem(plot)
+        plot_item.setTextAlignment(Qt.AlignCenter)
+        target_table.setItem(target_row, 2, plot_item)
+
+        # Cast
+        cast_item = QTableWidgetItem(cast)
+        cast_item.setTextAlignment(Qt.AlignCenter)
+        target_table.setItem(target_row, 3, cast_item)
+
+        # Rating
+        rating_item = QTableWidgetItem(rating)
+        rating_item.setTextAlignment(Qt.AlignCenter)
+        target_table.setItem(target_row, 4, rating_item)
+
+        # Update saved_movies
+        if title in self.saved_movies:
+            self.saved_movies[title]["list"] = (
+                "To Watch List" if target_table == self.table_tab1 else "Watched List"
+            )
+            self.save_movies()
+
+        # Update original_table_data
+        if current_table in self.original_table_data:
+            # Remove from current_table's original_table_data
+            for idx, row_data in enumerate(self.original_table_data[current_table]):
+                if row_data.get("title") == title:
+                    # Move to target_table's original_table_data
+                    if target_table not in self.original_table_data:
+                        self.original_table_data[target_table] = []
+                    self.original_table_data[target_table].append(row_data)
+                    del self.original_table_data[current_table][idx]
+                    break
+
+        # Remove the row from the current table
+        current_table.removeRow(row)
+
+        # Update counters
+        self.update_counter(
+            self.counter_tab1 if current_table == self.table_tab1 else self.counter_tab2, current_table
+        )
+        self.update_counter(
+            self.counter_tab1 if target_table == self.table_tab1 else self.counter_tab2, target_table
+        )
+
+    def is_duplicate(self, title_with_year, table):
+        """Check if a title with the year already exists in the given table."""
+        for row in range(table.rowCount()):
+            existing_title = table.item(row, 0)  # Column 0 contains titles
+            if existing_title and existing_title.text().strip().lower() == title_with_year.strip().lower():
+                return True
+        return False
+
+    # -----------------------------------
+    # Suggestions and Filtering
+    # -----------------------------------
+    def create_suggestion_item(self, title, year, poster_url, actors):
+        """Create a suggestion list item."""
+        widget = QWidget()
+        layout = QHBoxLayout()
+
+        # Add poster image
+        image_label = QLabel()
+        image_label.setFixedSize(92, 138)
+        if poster_url and poster_url != "N/A":
+            try:
+                pixmap = QPixmap()
+                pixmap.loadFromData(requests.get(poster_url).content)
+                image_label.setPixmap(
+                    pixmap.scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                )
+            except Exception as e:
+                print(f"[ERROR] Failed to load poster: {e}")
+                image_label.setText("No Image")
+        else:
+            image_label.setText("No Image")
+        layout.addWidget(image_label)
+
+        # Add movie details
+        title_label = QLabel(f"{title} ({year})")
+        title_label.setStyleSheet("color: white;")
+        title_label.setWordWrap(True)
+
+        actors_label = QLabel(f"Actors: {actors}")
+        actors_label.setStyleSheet("color: gray; font-size: 12px;")
+        actors_label.setWordWrap(True)
+
+        text_layout = QVBoxLayout()
+        text_layout.addWidget(title_label)
+        text_layout.addWidget(actors_label)
+
+        layout.addLayout(text_layout)
+        widget.setLayout(layout)
+        return widget
+
+    def on_text_changed(self, text, text_entry, suggestion_list):
+        text = text.strip()
+        
+        # Reset suggestions_active and handle a new query
+        self.suggestions_active = True
+
+        if len(text) >= 1: # Literally not needed, but I'm lazy :)
+            # Cancel ongoing suggestion thread
+            if self.suggestion_thread and self.suggestion_thread.isRunning():
+                self.suggestion_thread.stop()
+                self.suggestion_thread.wait()
+                self.suggestion_thread = None
+
+            # Start a timer to fetch suggestions after user stops typing
+            self.timer_tab1.timeout.disconnect()  # Disconnect any previous connections
+            self.timer_tab1.timeout.connect(lambda: self.fetch_suggestions(text_entry, suggestion_list))
+            self.timer_tab1.start(800)  # Start 800ms delay after typing
+        else:
+            # Hide the suggestion list if input is too short
+            suggestion_list.hide()
+
+    def fetch_suggestions(self, text_entry, suggestion_list):
+        text = text_entry.text().strip()
+        if not text or not self.suggestions_active:
+            print("[DEBUG] No text entered or suggestions disabled. Skipping fetch suggestions.")
+            return
+
+        # Mark query as in progress
+        self.query_in_progress = True
+
+        # Clear the suggestion list and current suggestions before fetching new suggestions
+        suggestion_list.clear()
+        self.current_suggestions = []
+
+        # Stop any running thread
+        if self.suggestion_thread is not None and self.suggestion_thread.isRunning():
+            self.suggestion_thread.stop()
+            self.suggestion_thread.wait()
+
+        # Start a new suggestion thread
+        self.suggestion_thread = FetchSuggestionsThread(text=text)
+        self.suggestion_thread.suggestionsFetched.connect(
+            lambda suggestion: self.add_unique_suggestion_to_list(suggestion, suggestion_list)
+        )
+        self.suggestion_thread.finished.connect(self.cleanup_suggestion_thread)
+
+        self.suggestion_thread.start()
+        print("[DEBUG] FetchSuggestionsThread started.")
+
+    def update_suggestions(self, suggestions, suggestion_list, text_entry):
+        print(f"[DEBUG] Received suggestions: {suggestions}")
+        if not suggestions:
+            print("[DEBUG] No suggestions to show.")
+            suggestion_list.hide()
+            return
+
+        suggestion_list.clear()
+
+        self.current_suggestions = suggestions[:max_suggestions]
+
+        # Debugging: Show the raw order from GPT
+        print(f"[DEBUG] GPT-sorted suggestions: {[s['title'] for s in self.current_suggestions]}")
+
+        # Add suggestions to the suggestion list in the same order as GPT provided
+        for suggestion in self.current_suggestions:
+            self.add_suggestion_to_list(suggestion, suggestion_list)
+
+        # Ensure the suggestion list is properly displayed
+        print(f"[DEBUG] Suggestion list height before setting: {suggestion_list.height()}")
+        suggestion_list.setFixedHeight(800)
+        print(f"[DEBUG] Suggestion list height after setting: {suggestion_list.height()}")
+        self.position_suggestion_list(text_entry, suggestion_list)
+        suggestion_list.show()
+
+    def add_suggestion_to_list(self, suggestion, suggestion_list):
+        """Dynamically add suggestions to the suggestion list."""
+        if not suggestion:
+            print("[ERROR] Empty suggestion passed.")
+            return
+
+        # Validate fields
+        title = suggestion.get("title", "Unknown Title")
+        year = suggestion.get("year", "Unknown Year")
+        poster_url = suggestion.get("poster_url", "")
+        actors = suggestion.get("actors", "N/A")
+
+        # Add to current_suggestions for later matching
+        self.current_suggestions.append(suggestion)
+        print(f"[DEBUG] Adding suggestion: {suggestion}")
+
+        # Create the list item
+        item_widget = self.create_suggestion_item(title, year, poster_url, actors)
+        item = QListWidgetItem(suggestion_list)
+        item.setSizeHint(item_widget.sizeHint())
+        suggestion_list.addItem(item)
+        suggestion_list.setItemWidget(item, item_widget)
+
+        # Show the suggestion list
+        if not suggestion_list.isVisible():
+            suggestion_list.show()
+
+    def add_unique_suggestion_to_list(self, suggestion, suggestion_list):
+        """Add suggestions to the list while ensuring uniqueness."""
+        if not self.suggestions_active or not self.query_in_progress:
+            print("[DEBUG] Suggestions fetching disabled. Ignoring suggestion.")
+            return
+
+        # Check for duplicates
+        existing_titles = {(s["title"].strip().lower(), s["year"].strip()) for s in self.current_suggestions}
+        title_key = (suggestion["title"].strip().lower(), suggestion["year"].strip())
+
+        if title_key in existing_titles:
+            print(f"[DEBUG] Duplicate suggestion ignored: {suggestion}")
+            return
+
+        # Respect max_suggestions (excluding the OMDb suggestion)
+        if len(self.current_suggestions) >= max_suggestions + 1:  # +1 for the OMDb suggestion
+            print(f"[DEBUG] Max suggestions reached. Ignoring suggestion: {suggestion}")
+            return
+
+        # Add suggestion to the current list
+        self.current_suggestions.append(suggestion)
+        print(f"[DEBUG] Added to current_suggestions: {suggestion}")
+
+        # Add to the suggestion list UI
+        item_widget = self.create_suggestion_item(
+            suggestion["title"], suggestion["year"], suggestion["poster_url"], suggestion["actors"]
+        )
+        item = QListWidgetItem(suggestion_list)
+        item.setSizeHint(item_widget.sizeHint())
+        suggestion_list.addItem(item)
+        suggestion_list.setItemWidget(item, item_widget)
+
+        if not suggestion_list.isVisible():
+            suggestion_list.show()
+
+    def select_suggestion(self, item, suggestion_list):
+        """Handle the selection of a suggestion."""
+        # Disable further querying temporarily
+        self.suggestions_active = False
+
+        # Stop any ongoing suggestion thread
+        if self.suggestion_thread is not None and self.suggestion_thread.isRunning():
+            self.suggestion_thread.stop()
+            self.suggestion_thread.wait()
+
+        active_tab_index = self.tabs.currentIndex()
+        table = self.table_tab1 if active_tab_index == 0 else self.table_tab2
+        text_entry = self.text_entry_tab1 if active_tab_index == 0 else self.text_entry_tab2
+
+        widget = suggestion_list.itemWidget(item)
+        if widget:
+            layout = widget.layout()
+            title_label = None
+            for i in range(layout.count()):
+                child_layout = layout.itemAt(i)
+                if isinstance(child_layout, QVBoxLayout):
+                    for j in range(child_layout.count()):
+                        child = child_layout.itemAt(j).widget()
+                        if isinstance(child, QLabel) and "(" in child.text():
+                            title_label = child
+                            break
+                    if title_label:
+                        break
+
+            if title_label:
+                suggestion_text = title_label.text().strip()
+                match = re.match(r"(.+?)\s\((\d{4}(?:–\d{4}|–)?)\)", suggestion_text)
+                if match:
+                    title = match.group(1).strip()
+                    year = match.group(2).strip()
+
+                    # Handle multi-year formats correctly
+                    title_with_year = f"{title} [{year}]"
+
+                    # Add the selected suggestion to the table
+                    self.add_movie_to_table(
+                        title=title_with_year,
+                        plot=None,
+                        rating=None,
+                        poster_path=None,
+                        cast=None,
+                        target_table=table,
+                    )
+
+        suggestion_list.hide()
+        text_entry.clear()
+
+        # Reactivate suggestions after selection
+        self.suggestions_active = True
+
+    def position_suggestion_list(self, text_entry, suggestion_list):
+        """Position the suggestion list directly below the given text entry."""
+        print("[DEBUG] Positioning suggestion list.")
+        text_entry_global_pos = text_entry.mapToGlobal(QPoint(0, text_entry.height()))
+        suggestion_list.move(text_entry_global_pos)
+        suggestion_list.setFixedWidth(text_entry.width())
+        print(f"[DEBUG] Suggestion list positioned at: {text_entry_global_pos}")
+
+    def filter_table_rows(self, table, filter_text):
+        """Filter rows in the table by title or cast."""
+        filter_text = filter_text.strip().lower()
+        if not filter_text:
+            self.restore_original_table_data(table)
+            return
+
+        if table not in self.original_table_data or not self.original_table_data[table]:
+            self.save_original_table_data(table)
+
+        table.setRowCount(0)
+        for row_data in self.original_table_data[table]:
+            title = row_data.get("title", "").lower()
+            cast = row_data.get("cast", "N/A").lower()
+            print(f"[DEBUG] Filtering row - Title: {title}, Cast: {cast}")
+
+            if filter_text in title or filter_text in cast:
+                self.add_filtered_row(table, row_data)
+
+    def save_original_table_data(self, table):
+        """Save the current data of the table to original_table_data."""
+        self.original_table_data[table] = []
+        for row in range(table.rowCount()):
+            title = table.item(row, 0).text() if table.item(row, 0) else ""
+            plot = table.item(row, 2).text() if table.item(row, 2) else ""
+            cast = table.item(row, 3).text() if table.item(row, 3) else "N/A"
+            rating = table.item(row, 4).text() if table.item(row, 4) else "N/A"
+            poster_widget = table.cellWidget(row, 1)
+            pixmap = poster_widget.pixmap() if poster_widget and poster_widget.pixmap() else None
+            self.original_table_data[table].append({
+                "title": title,
+                "plot": plot,
+                "cast": cast,
+                "rating": rating,
+                "pixmap": pixmap.copy() if pixmap else None,
+            })
+
+    def restore_original_table_data(self, table):
+        """Restore the table data from original_table_data."""
+        if table in self.original_table_data:
+            table.setRowCount(0)
+            for row_data in self.original_table_data[table]:
+                self.add_filtered_row(table, row_data)
+
+    def add_filtered_row(self, table, row_data):
+        try:
+            row_idx = table.rowCount()
+            table.insertRow(row_idx)
+
+            # Title
+            title_item = QTableWidgetItem(row_data.get("title", ""))
+            title_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row_idx, 0, title_item)
+
+            # Poster
+            new_label = QLabel()
+            pixmap = row_data.get("pixmap", None)
+            if pixmap and not pixmap.isNull():
+                new_label.setPixmap(pixmap.scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                new_label.setText("No Image")
+            new_label.setAlignment(Qt.AlignCenter)
+            table.setCellWidget(row_idx, 1, new_label)
+
+            # Plot
+            plot_item = QTableWidgetItem(row_data.get("plot", "N/A"))
+            plot_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row_idx, 2, plot_item)
+
+            # Cast
+            cast_item = QTableWidgetItem(row_data.get("cast", "N/A"))
+            cast_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row_idx, 3, cast_item)
+
+            # Rating
+            rating_item = QTableWidgetItem(row_data.get("rating", "N/A"))
+            rating_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row_idx, 4, rating_item)
+
+            table.setRowHeight(row_idx, 138)
+        except Exception as e:
+            print("Error while adding filtered row:", str(e))
+
+    def cleanup_suggestion_thread(self):
+        """Cleanup suggestion thread."""
+        self.suggestion_thread = None
+
+    def load_image_async(self, label, url):
+        """Load image asynchronously."""
+        thread = ImageLoaderThread(label, url)
+        thread.imageLoaded.connect(self.set_image)
+        thread.finished.connect(lambda: self.image_threads.remove(thread))
+        self.image_threads.append(thread)
+        thread.start()
+
+    def set_image(self, label, pixmap):
+        """Set the loaded image on the label with proper scaling."""
+        if pixmap and not pixmap.isNull():
+            scaled_pixmap = pixmap.scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            label.setPixmap(scaled_pixmap)
+        else:
+            label.setText("No Image")
+
+    # -----------------------------------
+    # Movie Data Management
+    # -----------------------------------
+    def save_movies(self):
+        """Save movies to the JSON file in the user-defined directory."""
+        try:
+            file_path = os.path.join(self.SAVE_DIR, "movies.json")
+            with open(file_path, "w") as file:
+                json.dump(self.saved_movies, file, indent=4)
+            print(f"[DEBUG] Movies saved to file at: {file_path}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save movies: {e}")
+    
+    def load_saved_movies(self):
+        """Load saved movies from the JSON file in the user-defined directory."""
+        try:
+            file_path = os.path.join(self.SAVE_DIR, "movies.json")
+            print(f"[DEBUG] Attempting to load movies from: {file_path}")
+            if os.path.exists(file_path):
+                with open(file_path, "r") as file:
+                    saved_movies = json.load(file)
+                    print(f"[DEBUG] Successfully loaded movies: {json.dumps(saved_movies, indent=4)}")
+                    return saved_movies
+            else:
+                print("[DEBUG] No saved movies file found. Returning empty dictionary.")
+                return {}
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Failed to parse saved movies JSON: {e}")
+            return {}
+        except Exception as e:
+            print(f"[ERROR] Failed to load saved movies: {e}")
+            return {}
+    
     def get_existing_list(self, title_with_year):
         """Check if a movie or show already exists in either list."""
         match = re.match(r"(.*?)(?:\s\[(\d{4}(?:–\d{4}|–)?)\])?$", title_with_year)
@@ -2870,19 +2683,164 @@ class MovieApp(QWidget):
                         return list_name
         return None
 
-    def mousePressEvent(self, event):
-        """Handle mouse clicks anywhere in the main widget."""
-        if not (self.text_entry_tab1.geometry().contains(event.pos()) or 
-                self.text_entry_tab2.geometry().contains(event.pos())):
-            # Clear focus from both text entry boxes
-            self.text_entry_tab1.clearFocus()
-            self.text_entry_tab2.clearFocus()
-            # Hide suggestion lists if not focused
-            self.suggestion_list_tab1.hide()
-            self.suggestion_list_tab2.hide()
+    def import_movies(self, target_table):
+        """Handle importing movies from a text file using threading."""
+        file_dialog = QFileDialog()
+        file_path, _ = file_dialog.getOpenFileName(self, "Select Movie List File", "", "Text Files (*.txt)")
 
-        super().mousePressEvent(event)
+        if not file_path:
+            return  # User canceled the dialog
 
+        try:
+            with open(file_path, "r") as file:
+                movie_titles = [line.strip() for line in file if line.strip()]
+
+            if not movie_titles:
+                QMessageBox.warning(self, "No Movies Found", "The selected file contains no movie titles.")
+                return
+
+            # Start the import thread
+            self.start_import_thread(movie_titles, target_table)
+        except Exception as e:
+            QMessageBox.critical(self, "File Error", f"An error occurred while reading the file: {e}")
+
+    def start_import_thread(self, movie_titles, target_table):
+        """Start a threaded movie import with a concurrent queue."""
+        self.is_busy = True
+        self.queue = Queue()
+        for title in movie_titles:
+            self.queue.put(title)
+
+        self.import_thread = ImportMoviesThread(movie_titles, self.queue)
+        self.import_thread.movieAdded.connect(
+            lambda movie_data: self.add_movie_to_table_incrementally(movie_data, target_table)
+        )
+        self.import_thread.finished.connect(self.on_import_finished)
+        self.import_thread.start()
+        QMessageBox.information(self, "Import Started", "Movies are being imported using a queue.")
+
+    def on_import_finished(self):
+        """Handle the end of the import process."""
+        self.is_busy = False
+        self.show_popup("Import complete. You can now move or delete titles.", color="green")
+        self.save_movies()
+
+    def start_querying_movies(self, movie_titles, target_table):
+        """Start querying movies using a thread."""
+        self.import_thread = ImportMoviesThread(movie_titles, target_table)
+        self.import_thread.movieAdded.connect(lambda movie_data: self.add_movie_to_table(
+            movie_data["title"],
+            movie_data["plot"],
+            movie_data["rating"],
+            movie_data["poster_path"],
+            movie_data["cast"],
+            target_table
+        ))
+        self.import_thread.finished.connect(lambda: QMessageBox.information(self, "Import Complete", "All movies have been processed."))
+        self.import_thread.start()
+
+    def scale_poster(self, poster_path):
+        """Scale poster images to fit within table entries."""
+        try:
+            pixmap = QPixmap(poster_path)
+            if not pixmap.isNull():
+                return pixmap.scaled(92, 138, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            else:
+                print(f"[ERROR] Pixmap is null for: {poster_path}")
+        except Exception as e:
+            print(f"[ERROR] Exception while scaling poster: {e}")
+        return None
+
+    def download_poster(self, url, title):
+        """Download and save the poster image locally in the user-defined directory."""
+        poster_path = os.path.join(self.SAVE_DIR, f"{title}.jpg")
+        if os.path.exists(poster_path):
+            return poster_path  # Return if already exists
+
+        try:
+            response = requests.get(url, timeout=5)
+            if response.status_code == 200:
+                with open(poster_path, "wb") as file:
+                    file.write(response.content)
+                return poster_path
+            else:
+                print(f"[ERROR] Failed to download poster. HTTP Status: {response.status_code}")
+        except Exception as e:
+            print(f"[ERROR] Exception while downloading poster: {e}")
+
+        return None  # Return None if download fails
+
+    def get_or_download_poster(self, poster_url, title):
+        """Get the poster from saved data or use a placeholder if unavailable."""
+        if not poster_url or poster_url == "N/A":  # Handle missing or invalid URLs
+            print(f"[DEBUG] Poster URL is invalid for title: {title}")
+            return "path/to/placeholder/image.jpg"  # Replace with an actual path to a placeholder image
+
+        poster_path = os.path.join(self.SAVE_DIR, f"{title}.jpg")
+        if os.path.exists(poster_path):
+            return poster_path
+
+        try:
+            response = requests.get(poster_url, timeout=5)
+            if response.status_code == 200:
+                with open(poster_path, "wb") as file:
+                    file.write(response.content)
+                return poster_path
+            else:
+                print(f"[ERROR] Failed to download poster. HTTP Status: {response.status_code}")
+        except Exception as e:
+            print(f"[ERROR] Exception while downloading poster: {e}")
+
+        # Use the placeholder if download fails
+        return "path/to/placeholder/image.jpg"
+    
+    def _load_and_populate_data_in_thread(self):
+        """Load and populate data incrementally in a background thread."""
+        self.is_busy = True  # Disable interactions
+        self.disable_user_interaction()
+        self.saved_movies = self.load_saved_movies()
+
+        self.loading_thread = DataLoadingThread(self.saved_movies)
+        self.loading_thread.dataLoaded.connect(
+            lambda movie_data: self.add_movie_to_table_incrementally(
+                movie_data,
+                self.table_tab1 if movie_data.get("list") == "To Watch List" else self.table_tab2
+            )
+        )
+        self.loading_thread.finished.connect(self.on_data_loaded)
+        self.loading_thread.start()
+
+    def on_data_loaded(self):
+        """Handle the end of the data loading process."""
+        self.is_busy = False  # Re-enable interactions
+        self.enable_user_interaction()
+        self.show_popup("Data loading complete. You can now move or delete titles.", color="green")
+
+        # Update tab names with the current counts
+        self.update_counter(self.counter_tab1, self.table_tab1)
+        self.update_counter(self.counter_tab2, self.table_tab2)
+
+    def update_counter(self, counter_label, table):
+        """Update the counter label with the total number of rows in the table, considering original_table_data."""
+        # Check if we have original data stored for the table
+        total_rows = len(self.original_table_data.get(table, [])) if table in self.original_table_data else table.rowCount()
+        counter_label.setText(f"Titles: {total_rows}")
+
+        # Update the tab name with the total row count
+        if table == self.table_tab1:
+            self.tabs.setTabText(0, f"To Watch List ({total_rows})")
+        elif table == self.table_tab2:
+            self.tabs.setTabText(1, f"Watched List ({total_rows})")
+
+    def update_table_with_filtered_data(self, table, filtered_data):
+        """Update the table with filtered rows."""
+        table.setRowCount(0)
+        for row_data in filtered_data:
+            self.add_filtered_row(table, row_data)
+
+    # -----------------------------------
+    # Popup Notifications
+    # -----------------------------------
     def show_popup(self, message, color="red"):
         """Show a non-blocking popup with a vertically centered message, close 'X' button, and timer."""
         popup = QWidget(self)
@@ -2969,104 +2927,121 @@ class MovieApp(QWidget):
             popup.deleteLater()  # Safely delete the popup
             self.adjust_popups()
 
-    def center_window(self):
-            """Center the main window on the screen."""
-            screen_geometry = QApplication.desktop().screenGeometry()
-            window_geometry = self.frameGeometry()
-            center_point = screen_geometry.center()
-            window_geometry.moveCenter(center_point)
-            self.move(window_geometry.topLeft())
+    # -----------------------------------
+    # API Key Management
+    # -----------------------------------
+    def open_revalidate_dialog(self):
+        """Open a dialog to allow revalidating one or both API keys."""
+        print("[DEBUG] Opening revalidate API keys dialog.")
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Switch API Keys")
+        dialog.setStyleSheet("background-color: #1C1C1C; color: white;")
+        layout = QFormLayout(dialog)
 
-    def keyPressEvent(self, event):
-        """Handle key press events."""
-        if event.key() == Qt.Key_Backslash:  # Check for the "\" key
-            self.show_popup("This is a test popup!", color="blue")
-        super().keyPressEvent(event)  # Call the parent class method for other key events
+        # Add checkboxes for selecting keys to revalidate
+        self.omdb_checkbox = QCheckBox("Switch OMDB API Key")
+        self.omdb_checkbox.setStyleSheet("color: white;")
+        layout.addRow(self.omdb_checkbox)
 
-    def open_settings_window(self):
-        """Open the settings window."""
-        settings_window = QDialog(self)
-        settings_window.setWindowTitle("Settings")
-        settings_window.setFixedSize(400, 300)
-        settings_window.setStyleSheet("background-color: #1C1C1C; color: white;")
+        self.openai_checkbox = QCheckBox("Switch OpenAI API Key")
+        self.openai_checkbox.setStyleSheet("color: white;")
+        layout.addRow(self.openai_checkbox)
 
-        layout = QGridLayout(settings_window)
-        layout.setSpacing(5)
+        # Add dialog buttons
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        layout.addWidget(buttons)
 
-        # Add Switch API Keys button
-        switch_api_keys_button = QPushButton("Switch API Keys")
-        switch_api_keys_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2E2E2E;
-                color: white;
-                border: 1px solid white;
-                border-radius: 5px;
-                padding: 5px 10px;
-            }
-            QPushButton:hover {
-                background-color: #4E4E4E;
-            }
-            QPushButton:pressed {
-                background-color: #1E1E1E;
-            }
-        """)
-        switch_api_keys_button.clicked.connect(self.open_revalidate_dialog)
-        layout.addWidget(switch_api_keys_button, 0, 0, 1, 3)
+        # Connect the dialog buttons
+        buttons.accepted.connect(lambda: self.handle_revalidate_keys(dialog))
+        buttons.rejected.connect(dialog.reject)
 
-        # Add Move Data Directory button
-        move_data_dir_button = QPushButton("Move Data Directory")
-        move_data_dir_button.setStyleSheet("""
-            QPushButton {
-                background-color: #2E2E2E;
-                color: white;
-                border: 1px solid white;
-                border-radius: 5px;
-                padding: 5px 10px;
-            }
-            QPushButton:hover {
-                background-color: #4E4E4E;
-            }
-            QPushButton:pressed {
-                background-color: #1E1E1E;
-            }
-        """)
-        move_data_dir_button.clicked.connect(self.move_data_directory)
-        layout.addWidget(move_data_dir_button, 1, 0, 1, 3)
+        # Show dialog
+        dialog.exec_()
+        print("[DEBUG] Revalidate API keys dialog closed.")
 
-        # Add Max Suggestions entry and Save button in the next row
-        max_suggestions_label = QLabel("Maximum Suggestions:")
-        max_suggestions_label.setStyleSheet("color: white;")
-        layout.addWidget(max_suggestions_label, 3, 0)  # Adjusted to row 3
+    def handle_revalidate_keys(self, dialog):
+        print("[DEBUG] Revalidate API keys dialog confirmed.")
+        omdb_revalidate = self.omdb_checkbox.isChecked()
+        openai_revalidate = self.openai_checkbox.isChecked()
 
-        max_suggestions_entry = QLineEdit(str(max_suggestions))
-        max_suggestions_entry.setValidator(QIntValidator(1, 100))
-        layout.addWidget(max_suggestions_entry, 3, 1)  # Adjusted to row 3
+        print(f"[DEBUG] Selected revalidation - OMDB: {omdb_revalidate}, OpenAI: {openai_revalidate}")
 
-        save_button = QPushButton("Save")
-        save_button.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                border-radius: 5px;
-                padding: 5px 10px;
-            }
-            QPushButton:hover {
-                background-color: #45A049;
-            }
-        """)
-        save_button.clicked.connect(lambda: self.save_settings(max_suggestions_entry.text(), settings_window))
-        layout.addWidget(save_button, 3, 2)  # Adjusted to row 3
+        config = configparser.ConfigParser()
+        config.read(CONFIG_FILE)
+        encryption_key = config['Settings']['encryption_key']
+        api_key_file = os.path.join(CONFIG_DIR, "api_keys.secure")
 
-        # Add an empty row
-        empty_widget1 = QWidget()  # This will be an empty row
-        layout.addWidget(empty_widget1, 4, 0)
+        try:
+            current_omdb_key, current_openai_key = load_api_keys(api_key_file, encryption_key)
+        except Exception as e:
+            print(f"[ERROR] Failed to load existing API keys: {e}")
+            current_omdb_key, current_openai_key = None, None
 
-        # Add another empty row if needed
-        empty_widget2 = QWidget()  # Another empty row
-        layout.addWidget(empty_widget2, 5, 0)
+        # Revalidate OMDB API Key
+        if omdb_revalidate:
+            while True:
+                omdb_dialog = CustomInputDialog("Switch OMDB API Key", "Enter new OMDB API Key:", cancel_text="Cancel")
+                if omdb_dialog.exec_() == QDialog.Accepted:
+                    omdb_key = omdb_dialog.get_input()
+                    if not omdb_key:
+                        QMessageBox.warning(self, "Invalid Key", "OMDB API Key cannot be empty.")
+                        continue
+                    if validate_api_key_omdb(omdb_key):
+                        print("[DEBUG] OMDB API Key validated successfully.")
+                        break
+                    else:
+                        QMessageBox.warning(self, "Invalid Key", "OMDB API Key is invalid.")
+                        print("[DEBUG] OMDB API Key validation failed.")
+                else:
+                    print("[DEBUG] User canceled OMDB API Key revalidation.")
+                    omdb_key = current_omdb_key  # Fallback to the current key
+                    break
+        else:
+            omdb_key = current_omdb_key  # Use the existing key if not revalidated
 
-        settings_window.setLayout(layout)
-        settings_window.exec_()
+        # Revalidate OpenAI API Key
+        if openai_revalidate:
+            while True:
+                openai_dialog = CustomInputDialog("Switch OpenAI API Key", "Enter new OpenAI API Key:", cancel_text="Cancel")
+                if openai_dialog.exec_() == QDialog.Accepted:
+                    new_openai_key = openai_dialog.get_input()
+                    if not new_openai_key:
+                        QMessageBox.warning(self, "Invalid Key", "OpenAI API Key cannot be empty.")
+                        continue
+                    if validate_api_key_openai(new_openai_key):
+                        print("[DEBUG] OpenAI API Key validated successfully.")
+                        global openai_key  # Update the global variable
+                        openai_key = new_openai_key
+                        openai.api_key = new_openai_key  # Update OpenAI library with the new key
+                        break
+                    else:
+                        QMessageBox.warning(self, "Invalid Key", "OpenAI API Key is invalid.")
+                        print("[DEBUG] OpenAI API Key validation failed.")
+                else:
+                    print("[DEBUG] User canceled OpenAI API Key revalidation.")
+                    new_openai_key = current_openai_key  # Fallback to the current key
+                    break
+        else:
+            new_openai_key = current_openai_key  # Use the existing key if not revalidated
+
+        # Save the revalidated keys
+        try:
+            save_api_keys(omdb_key, new_openai_key, api_key_file, encryption_key)
+            print("[DEBUG] API keys saved successfully.")
+        except Exception as e:
+            print(f"[ERROR] Failed to save API keys: {e}")
+            QMessageBox.critical(self, "Save Error", "Failed to save API keys. Please try again.")
+
+        # Refresh threads
+        if self.suggestion_thread and self.suggestion_thread.isRunning():
+            print("[DEBUG] Terminating active suggestion thread.")
+            self.suggestion_thread.terminate()
+            self.suggestion_thread.wait()
+            self.suggestion_thread = None
+
+        dialog.accept()
+        print("[DEBUG] Revalidate API keys dialog closed.")
 
     def save_settings(self, max_suggestions_value, settings_window):
         global max_suggestions
@@ -3081,6 +3056,30 @@ class MovieApp(QWidget):
             self.show_popup("Settings saved successfully.", color="green")
         except ValueError:
             self.show_popup("Invalid value for maximum suggestions.", color="red")
+
+        # Misc.
+    
+    # -----------------------------------
+    # Miscellaneous
+    # -----------------------------------
+    def cleanup_thread(self):
+        """Cleanup the thread after it finishes."""
+        self.thread = None
+
+    def closeEvent(self, event):
+        """Handle window close event."""
+
+        # Stop the suggestion thread
+        if self.suggestion_thread is not None and self.suggestion_thread.isRunning():
+            self.suggestion_thread.stop()
+            self.suggestion_thread.wait()
+
+        # Stop all image threads
+        for thread in self.image_threads:
+            thread.terminate()
+        self.image_threads.clear()
+
+        event.accept()
 
 def main():
     global omdb_key, openai_key
