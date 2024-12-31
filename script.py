@@ -1042,6 +1042,7 @@ class MovieApp(QWidget):
         self.current_suggestions = []
         self.suggestion_list_tab1 = None
         self.suggestion_list_tab2 = None
+        self.query_in_progress = False
 
         self.suggestions_active = True
         self.is_busy = False
@@ -1167,25 +1168,60 @@ class MovieApp(QWidget):
         tab1_layout.addWidget(import_button_tab1_container)
 
         # Add a container widget for the text entry
-        text_entry_container = QWidget()
-        text_entry_layout = QVBoxLayout()
-        text_entry_layout.setAlignment(Qt.AlignHCenter)  # Center the text entry horizontally
-        text_entry_container.setLayout(text_entry_layout)
-        tab1_layout.addWidget(text_entry_container)
+        search_container = QWidget()
+        search_layout = QHBoxLayout()
+        search_layout.setAlignment(Qt.AlignHCenter)  # Center the search elements horizontally
+        search_container.setLayout(search_layout)
+        tab1_layout.addWidget(search_container)
+
+        # Calculate dimensions to match the filter box width exactly
+        filter_box_width = 500  # Same as filter box's maximum width
+        search_button_width = 100  # Width of the search button
+        padding = 10  # Space between the text box and the button
+        manualoffset = 7 # Shhh :)
+        search_box_width = filter_box_width - search_button_width - padding - manualoffset
 
         # Add text entry box
         self.text_entry_tab1 = QLineEdit()
         self.text_entry_tab1.setFont(QFont("Arial", 12))
-        self.text_entry_tab1.setAlignment(Qt.AlignCenter)
+        self.text_entry_tab1.setAlignment(Qt.AlignCenter)  # Center the text within the box
         self.text_entry_tab1.setPlaceholderText("Enter movie details...")
-        self.text_entry_tab1.setStyleSheet("background-color: #1C1C1C; color: white;")
-        
-        # Set minimum and maximum width
-        self.text_entry_tab1.setMinimumWidth(300)  # Minimum width
-        self.text_entry_tab1.setMaximumWidth(500)  # Maximum width
+        self.text_entry_tab1.setStyleSheet("""
+            QLineEdit {
+                background-color: #2C2C2C;  /* Background color */
+                color: white;              /* Text color */
+                border: 1px solid white;   /* White border */
+                border-radius: 0px;        /* Rounded corners */
+                padding: 0px;              /* Padding inside the box */
+            }
+        """)
+        self.text_entry_tab1.setFixedWidth(search_box_width)  # Dynamically adjust width
+        self.text_entry_tab1.returnPressed.connect(self.trigger_search)  # Trigger search on ENTER
+        search_layout.addWidget(self.text_entry_tab1)
 
-        # Add the text entry to the centered layout
-        text_entry_layout.addWidget(self.text_entry_tab1)
+        # Add spacing between the text entry and the button
+        search_layout.addSpacing(padding)
+
+        # Add search button
+        self.search_button = QPushButton("Search")
+        self.search_button.setFont(QFont("Arial", 12))
+        self.search_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border-radius: 0px;
+                padding: 2.5px;
+            }
+            QPushButton:hover {
+                background-color: #45A049;
+            }
+            QPushButton:pressed {
+                background-color: #3C8C43;
+            }
+        """)
+        self.search_button.setFixedWidth(search_button_width)
+        self.search_button.clicked.connect(self.trigger_search)
+        search_layout.addWidget(self.search_button)
 
         # Add filtering entry box
         self.filter_entry_tab1 = QLineEdit()
@@ -1193,13 +1229,14 @@ class MovieApp(QWidget):
         self.filter_entry_tab1.setAlignment(Qt.AlignCenter)
         self.filter_entry_tab1.setPlaceholderText("Filter by title...")
         self.filter_entry_tab1.setStyleSheet("background-color: #2C2C2C; color: white;")
-        text_entry_container = QWidget()
+        self.filter_entry_tab1.setFixedWidth(filter_box_width)  # Match the width of search + button + padding
+
+        filter_container_tab1 = QWidget()
         filter_entry_tab1_layout = QVBoxLayout()
-        filter_entry_tab1_layout.setAlignment(Qt.AlignHCenter)  # Center the text entry horizontally
-        text_entry_container.setLayout(filter_entry_tab1_layout)
-        tab1_layout.addWidget(text_entry_container)
-        
-        tab1_layout.addWidget(self.filter_entry_tab1)
+        filter_entry_tab1_layout.setAlignment(Qt.AlignHCenter)  # Center the filter box horizontally
+        filter_container_tab1.setLayout(filter_entry_tab1_layout)
+        tab1_layout.addWidget(filter_container_tab1)
+
         filter_entry_tab1_layout.addWidget(self.filter_entry_tab1)
         # Connect the filtering box to the filtering logic
         self.filter_entry_tab1.textChanged.connect(
@@ -1231,9 +1268,6 @@ class MovieApp(QWidget):
         self.suggestion_list_tab1.verticalScrollBar().setSingleStep(8)
 
         # Connect the text entry to update suggestions
-        self.text_entry_tab1.textChanged.connect(
-            lambda text: self.on_text_changed(text, self.text_entry_tab1, self.suggestion_list_tab1)
-        )
         self.suggestion_list_tab1.itemClicked.connect(
             lambda item: self.select_suggestion(item, self.suggestion_list_tab1)
         )
@@ -1331,25 +1365,60 @@ class MovieApp(QWidget):
         tab2_layout.addWidget(import_button_tab2_container)
         
         # Add a container widget for the text entry
-        text_entry_container = QWidget()
-        text_entry_layout = QVBoxLayout()
-        text_entry_layout.setAlignment(Qt.AlignHCenter)
-        text_entry_container.setLayout(text_entry_layout)
-        tab2_layout.addWidget(text_entry_container)
+        search_container = QWidget()
+        search_layout = QHBoxLayout()
+        search_layout.setAlignment(Qt.AlignHCenter)  # Center the search elements horizontally
+        search_container.setLayout(search_layout)
+        tab2_layout.addWidget(search_container)
+
+        # Calculate dimensions to match the filter box width exactly
+        filter_box_width = 500  # Same as filter box's maximum width
+        search_button_width = 100  # Width of the search button
+        padding = 10  # Space between the text box and the button
+        manualoffset = 7 # Shhh :)
+        search_box_width = filter_box_width - search_button_width - padding - manualoffset
 
         # Add text entry box
         self.text_entry_tab2 = QLineEdit()
         self.text_entry_tab2.setFont(QFont("Arial", 12))
-        self.text_entry_tab2.setAlignment(Qt.AlignCenter)
+        self.text_entry_tab2.setAlignment(Qt.AlignCenter)  # Center the text within the box
         self.text_entry_tab2.setPlaceholderText("Enter movie details...")
-        self.text_entry_tab2.setStyleSheet("background-color: #1C1C1C; color: white;")
-        
-        # Set minimum and maximum width
-        self.text_entry_tab2.setMinimumWidth(300)
-        self.text_entry_tab2.setMaximumWidth(500)
+        self.text_entry_tab2.setStyleSheet("""
+            QLineEdit {
+                background-color: #2C2C2C;  /* Background color */
+                color: white;              /* Text color */
+                border: 1px solid white;   /* White border */
+                border-radius: 0px;        /* Rounded corners */
+                padding: 0px;              /* Padding inside the box */
+            }
+        """)
+        self.text_entry_tab2.setFixedWidth(search_box_width)  # Dynamically adjust width
+        self.text_entry_tab2.returnPressed.connect(self.trigger_search)  # Trigger search on ENTER
+        search_layout.addWidget(self.text_entry_tab2)
 
-        # Add the text entry to the centered layout
-        text_entry_layout.addWidget(self.text_entry_tab2)
+        # Add spacing between the text entry and the button
+        search_layout.addSpacing(padding)
+
+        # Add search button
+        self.search_button = QPushButton("Search")
+        self.search_button.setFont(QFont("Arial", 12))
+        self.search_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border-radius: 0px;
+                padding: 2.5px;
+            }
+            QPushButton:hover {
+                background-color: #45A049;
+            }
+            QPushButton:pressed {
+                background-color: #3C8C43;
+            }
+        """)
+        self.search_button.setFixedWidth(search_button_width)
+        self.search_button.clicked.connect(self.trigger_search)
+        search_layout.addWidget(self.search_button)
 
         # Add filtering entry box
         self.filter_entry_tab2 = QLineEdit()
@@ -1357,21 +1426,22 @@ class MovieApp(QWidget):
         self.filter_entry_tab2.setAlignment(Qt.AlignCenter)
         self.filter_entry_tab2.setPlaceholderText("Filter by title...")
         self.filter_entry_tab2.setStyleSheet("background-color: #2C2C2C; color: white;")
-        text_entry_container = QWidget()
+        self.filter_entry_tab2.setFixedWidth(filter_box_width)  # Match the width of search + button + padding
+
+        filter_container_tab2 = QWidget()
         filter_entry_tab2_layout = QVBoxLayout()
-        filter_entry_tab2_layout.setAlignment(Qt.AlignHCenter)
-        text_entry_container.setLayout(filter_entry_tab2_layout)
-        tab2_layout.addWidget(text_entry_container)
-        
-        tab2_layout.addWidget(self.filter_entry_tab2)
+        filter_entry_tab2_layout.setAlignment(Qt.AlignHCenter)  # Center the filter box horizontally
+        filter_container_tab2.setLayout(filter_entry_tab2_layout)
+        tab2_layout.addWidget(filter_container_tab2)
+
         filter_entry_tab2_layout.addWidget(self.filter_entry_tab2)
         # Connect the filtering box to the filtering logic
         self.filter_entry_tab2.textChanged.connect(
             lambda text: self.filter_table_rows(self.table_tab2, text)
         )
 
-        self.filter_entry_tab2.setMinimumWidth(300)
-        self.filter_entry_tab2.setMaximumWidth(500)
+        self.filter_entry_tab2.setMinimumWidth(300)  # Minimum width
+        self.filter_entry_tab2.setMaximumWidth(500)  # Maximum width 
 
         # Add a horizontal container for the counter and filter entry
         filter_container = QWidget()
@@ -1665,6 +1735,65 @@ class MovieApp(QWidget):
                     )
             elif action == move_action:
                 self.move_entry_to_other_tab(row, current_table, target_table)
+
+    def reset_search_button(self):
+        """Reset the search button to its original state."""
+        self.search_button.setText("Search")
+        self.search_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                color: white;
+                border-radius: 0px;
+                padding: 2.5px;
+            }
+            QPushButton:hover {
+                background-color: #45A049;
+            }
+            QPushButton:pressed {
+                background-color: #3C8C43;
+            }
+        """)
+        self.search_button.clicked.disconnect()
+        self.search_button.clicked.connect(self.trigger_search)
+    
+    def cancel_search(self):
+        """Cancel the current search."""
+        if self.suggestion_thread and self.suggestion_thread.isRunning():
+            print("[DEBUG] Canceling the search thread.")
+            self.query_in_progress = False
+            self.suggestion_thread.stop()
+            self.suggestion_thread.wait()
+
+        self.reset_search_button()
+    
+    def trigger_search(self):
+        """Start querying suggestions."""
+        text = self.text_entry_tab1.text().strip()
+        if not text:
+            print("[DEBUG] Search text is empty. Aborting search.")
+            return
+
+        # Change button text
+        self.search_button.setText("Cancel")
+        self.search_button.setStyleSheet("""
+            QPushButton {
+                background-color: #FF6347;
+                color: white;
+                border-radius: 0px;
+                padding: 2.5px;
+            }
+            QPushButton:hover {
+                background-color: #FF4500;
+            }
+            QPushButton:pressed {
+                background-color: #CC3700;
+            }
+        """)
+        self.search_button.clicked.disconnect()
+        self.search_button.clicked.connect(self.cancel_search)
+
+        # Start the fetch suggestions logic
+        self.fetch_suggestions(self.text_entry_tab1, self.suggestion_list_tab1)
 
     # -----------------------------------
     # Tab Switching
@@ -2318,44 +2447,42 @@ class MovieApp(QWidget):
         widget.setLayout(layout)
         return widget
 
-    def on_text_changed(self, text, text_entry, suggestion_list):
-        text = text.strip()
-        
-        # Reset suggestions_active and handle a new query
-        self.suggestions_active = True
-
-        if len(text) >= 1: # Literally not needed, but I'm lazy :)
-            # Cancel ongoing suggestion thread
-            if self.suggestion_thread and self.suggestion_thread.isRunning():
-                self.suggestion_thread.stop()
-                self.suggestion_thread.wait()
-                self.suggestion_thread = None
-
-            # Start a timer to fetch suggestions after user stops typing
-            self.timer_tab1.timeout.disconnect()  # Disconnect any previous connections
-            self.timer_tab1.timeout.connect(lambda: self.fetch_suggestions(text_entry, suggestion_list))
-            self.timer_tab1.start(800)  # Start 800ms delay after typing
-        else:
-            # Hide the suggestion list if input is too short
-            suggestion_list.hide()
-
     def fetch_suggestions(self, text_entry, suggestion_list):
+        """Fetch movie suggestions."""
         text = text_entry.text().strip()
         if not text or not self.suggestions_active:
             print("[DEBUG] No text entered or suggestions disabled. Skipping fetch suggestions.")
+            self.reset_search_button()
             return
 
-        # Mark query as in progress
-        self.query_in_progress = True
-
-        # Clear the suggestion list and current suggestions before fetching new suggestions
+        # Clear the suggestion list before fetching new suggestions
         suggestion_list.clear()
         self.current_suggestions = []
 
-        # Stop any running thread
-        if self.suggestion_thread is not None and self.suggestion_thread.isRunning():
-            self.suggestion_thread.stop()
-            self.suggestion_thread.wait()
+        # Start a new suggestion thread
+        self.query_in_progress = True
+        self.suggestion_thread = FetchSuggestionsThread(text=text)
+        self.suggestion_thread.suggestionsFetched.connect(
+            lambda suggestion: self.add_unique_suggestion_to_list(suggestion, suggestion_list)
+        )
+        self.suggestion_thread.finished.connect(self.cleanup_suggestion_thread)
+
+        self.suggestion_thread.start()
+        print("[DEBUG] FetchSuggestionsThread started.")
+
+    def fetch_suggestions(self, text_entry, suggestion_list):
+        """Fetch movie suggestions."""
+        text = text_entry.text().strip()
+        if not text or not self.suggestions_active:
+            print("[DEBUG] No text entered or suggestions disabled. Skipping fetch suggestions.")
+            self.reset_search_button()
+            self.query_in_progress = False  # Ensure it's reset
+            return
+
+        # Clear the suggestion list before fetching new suggestions
+        suggestion_list.clear()
+        self.current_suggestions = []
+        self.query_in_progress = True  # Set the query in progress flag
 
         # Start a new suggestion thread
         self.suggestion_thread = FetchSuggestionsThread(text=text)
@@ -2366,31 +2493,6 @@ class MovieApp(QWidget):
 
         self.suggestion_thread.start()
         print("[DEBUG] FetchSuggestionsThread started.")
-
-    def update_suggestions(self, suggestions, suggestion_list, text_entry):
-        print(f"[DEBUG] Received suggestions: {suggestions}")
-        if not suggestions:
-            print("[DEBUG] No suggestions to show.")
-            suggestion_list.hide()
-            return
-
-        suggestion_list.clear()
-
-        self.current_suggestions = suggestions[:max_suggestions]
-
-        # Debugging: Show the raw order from GPT
-        print(f"[DEBUG] GPT-sorted suggestions: {[s['title'] for s in self.current_suggestions]}")
-
-        # Add suggestions to the suggestion list in the same order as GPT provided
-        for suggestion in self.current_suggestions:
-            self.add_suggestion_to_list(suggestion, suggestion_list)
-
-        # Ensure the suggestion list is properly displayed
-        print(f"[DEBUG] Suggestion list height before setting: {suggestion_list.height()}")
-        suggestion_list.setFixedHeight(800)
-        print(f"[DEBUG] Suggestion list height after setting: {suggestion_list.height()}")
-        self.position_suggestion_list(text_entry, suggestion_list)
-        suggestion_list.show()
 
     def add_suggestion_to_list(self, suggestion, suggestion_list):
         """Dynamically add suggestions to the suggestion list."""
@@ -2602,7 +2704,9 @@ class MovieApp(QWidget):
 
     def cleanup_suggestion_thread(self):
         """Cleanup suggestion thread."""
+        self.query_in_progress = False  # Reset the query in progress flag
         self.suggestion_thread = None
+        self.reset_search_button()  # Ensure button is reset after query
 
     def load_image_async(self, label, url):
         """Load image asynchronously."""
