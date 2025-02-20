@@ -24,7 +24,7 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QShortcut,
 )
-from PyQt5.QtGui import QFont, QPixmap, QColor, QIcon, QIntValidator, QKeySequence
+from PyQt5.QtGui import QFont, QPixmap, QColor, QIcon, QIntValidator, QKeySequence, QDoubleValidator
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPoint, QSize
 import requests
 import re
@@ -1185,7 +1185,7 @@ class MovieApp(QWidget):
         self.text_entry_tab1 = QLineEdit()
         self.text_entry_tab1.setFont(QFont("Arial", 12))
         self.text_entry_tab1.setAlignment(Qt.AlignCenter)  # Center the text within the box
-        self.text_entry_tab1.setPlaceholderText("Enter movie details...")
+        self.text_entry_tab1.setPlaceholderText("Enter title...")
         self.text_entry_tab1.setStyleSheet("""
             QLineEdit {
                 background-color: #2C2C2C;  /* Background color */
@@ -1227,7 +1227,7 @@ class MovieApp(QWidget):
         self.filter_entry_tab1 = QLineEdit()
         self.filter_entry_tab1.setFont(QFont("Arial", 12))
         self.filter_entry_tab1.setAlignment(Qt.AlignCenter)
-        self.filter_entry_tab1.setPlaceholderText("Filter by title...")
+        self.filter_entry_tab1.setPlaceholderText("Filter by title or cast...")
         self.filter_entry_tab1.setStyleSheet("background-color: #2C2C2C; color: white;")
         self.filter_entry_tab1.setFixedWidth(filter_box_width)  # Match the width of search + button + padding
 
@@ -1273,8 +1273,8 @@ class MovieApp(QWidget):
         )
 
         # Add table
-        self.table_tab1 = QTableWidget(0, 5)
-        self.table_tab1.setHorizontalHeaderLabels(["Title", "Poster", "Plot", "Cast", "Rating"])
+        self.table_tab1 = QTableWidget(0, 6)
+        self.table_tab1.setHorizontalHeaderLabels(["Title", "Poster", "Plot", "Cast", "IMDb Rating", "Personal Rating"])
         self.table_tab1.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_tab1.setStyleSheet("""
             QTableWidget {
@@ -1301,6 +1301,9 @@ class MovieApp(QWidget):
         self.table_tab1.horizontalHeader().sectionClicked.connect(
         lambda col: self.sort_table(self.table_tab1, col)
         )
+
+        self.table_tab1.cellChanged.connect(self.handle_personal_rating_change)
+
         self.populate_table()
         tab1_layout.addWidget(self.table_tab1)
 
@@ -1382,7 +1385,7 @@ class MovieApp(QWidget):
         self.text_entry_tab2 = QLineEdit()
         self.text_entry_tab2.setFont(QFont("Arial", 12))
         self.text_entry_tab2.setAlignment(Qt.AlignCenter)  # Center the text within the box
-        self.text_entry_tab2.setPlaceholderText("Enter movie details...")
+        self.text_entry_tab2.setPlaceholderText("Enter title...")
         self.text_entry_tab2.setStyleSheet("""
             QLineEdit {
                 background-color: #2C2C2C;  /* Background color */
@@ -1424,7 +1427,7 @@ class MovieApp(QWidget):
         self.filter_entry_tab2 = QLineEdit()
         self.filter_entry_tab2.setFont(QFont("Arial", 12))
         self.filter_entry_tab2.setAlignment(Qt.AlignCenter)
-        self.filter_entry_tab2.setPlaceholderText("Filter by title...")
+        self.filter_entry_tab2.setPlaceholderText("Filter by title or cast...")
         self.filter_entry_tab2.setStyleSheet("background-color: #2C2C2C; color: white;")
         self.filter_entry_tab2.setFixedWidth(filter_box_width)  # Match the width of search + button + padding
 
@@ -1474,8 +1477,8 @@ class MovieApp(QWidget):
         )
 
         # Add table
-        self.table_tab2 = QTableWidget(0, 5)
-        self.table_tab2.setHorizontalHeaderLabels(["Title", "Poster", "Plot", "Cast", "Rating"])
+        self.table_tab2 = QTableWidget(0, 6)
+        self.table_tab2.setHorizontalHeaderLabels(["Title", "Poster", "Plot", "Cast", "IMDb Rating", "Personal Rating"])
         self.table_tab2.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_tab2.setStyleSheet("""
             QTableWidget {
@@ -1502,6 +1505,9 @@ class MovieApp(QWidget):
         self.table_tab2.horizontalHeader().sectionClicked.connect(
         lambda col: self.sort_table(self.table_tab2, col)
         )
+
+        self.table_tab2.cellChanged.connect(self.handle_personal_rating_change)
+
         self.populate_table()
         tab2_layout.addWidget(self.table_tab2)
 
@@ -1794,6 +1800,39 @@ class MovieApp(QWidget):
 
         # Start the fetch suggestions logic
         self.fetch_suggestions(self.text_entry_tab1, self.suggestion_list_tab1)
+
+    def handle_personal_rating_change(self, row, column):
+        """Handle updates to the Personal Rating column."""
+        if column == 5:  # Personal Rating column index
+            active_table = self.table_tab1 if self.tabs.currentIndex() == 0 else self.table_tab2
+            title_item = active_table.item(row, 0)
+            rating_item = active_table.item(row, column)
+
+            if title_item and title_item.text().strip():
+                title = title_item.text().strip()
+                try:
+                    # Validate the input
+                    rating = float(rating_item.text().strip()) if rating_item and rating_item.text().strip() else None
+                    if rating is not None and (rating < 0 or rating > 10):
+                        raise ValueError("Rating must be between 0 and 10.")
+                    
+                    # Update the `saved_movies` dictionary
+                    if title in self.saved_movies:
+                        self.saved_movies[title]["personal_rating"] = rating
+                        print(f"[DEBUG] Updating personal rating for '{title}': {rating}")
+                        
+                        # Save the updated dictionary
+                        self.save_movies()
+                    else:
+                        print(f"[ERROR] Title '{title}' not found in saved_movies.")
+                
+                except ValueError:
+                    # Revert invalid input
+                    print(f"[ERROR] Invalid rating entered for '{title}'.")
+                    self.show_popup("Invalid Rating! Please enter a number between 0 and 10.", color="red")
+                    if title in self.saved_movies:
+                        saved_rating = self.saved_movies[title].get("personal_rating", "")
+                        rating_item.setText(str(saved_rating) if saved_rating is not None else "")
 
     # -----------------------------------
     # Tab Switching
@@ -2198,14 +2237,15 @@ class MovieApp(QWidget):
     def sort_table(self, table, column):
         """Sort the table based on the clicked column with four sorting states."""
         # Define the column-specific sorting state keys
-        sort_states = table.property("sort_states") or {0: 0, 4: 0}
+        sort_states = table.property("sort_states") or {0: 0, 4: 0, 5: 0}
         current_state = sort_states.get(column, 0)
 
         # Get all row data and store it in a list
         row_data = []
         for row in range(table.rowCount()):
             title = table.item(row, 0).text() if table.item(row, 0) else ""
-            rating = float(table.item(row, 4).text()) if table.item(row, 4) and table.item(row, 4).text().replace('.', '', 1).isdigit() else 0.0
+            imdb_rating = float(table.item(row, 4).text()) if table.item(row, 4) and table.item(row, 4).text().replace('.', '', 1).isdigit() else 0.0
+            personal_rating = float(table.item(row, 5).text()) if table.item(row, 5) and table.item(row, 5).text().replace('.', '', 1).isdigit() else 0.0
             cast = table.item(row, 3).text() if table.item(row, 3) else ""
             plot = table.item(row, 2).text() if table.item(row, 2) else ""
             widget = table.cellWidget(row, 1)
@@ -2214,7 +2254,8 @@ class MovieApp(QWidget):
             # Store the row data
             row_data.append({
                 "title": title,
-                "rating": rating,
+                "imdb rating": imdb_rating,
+                "personal_rating": personal_rating,  # Ensure the key exists
                 "cast": cast,
                 "plot": plot,
                 "pixmap": pixmap,
@@ -2228,9 +2269,14 @@ class MovieApp(QWidget):
                 row_data.sort(key=lambda x: x["title"], reverse=True)  # Z-A
         elif column == 4:
             if current_state == 0:
-                row_data.sort(key=lambda x: x["rating"], reverse=True)  # Highest to Lowest
+                row_data.sort(key=lambda x: x["imdb rating"], reverse=True)  # Highest to Lowest
             elif current_state == 1:
-                row_data.sort(key=lambda x: x["rating"], reverse=False)  # Lowest to Highest
+                row_data.sort(key=lambda x: x["imdb rating"], reverse=False)  # Lowest to Highest
+        elif column == 5:
+            if current_state == 0:
+                row_data.sort(key=lambda x: x["personal_rating"], reverse=True)  # Highest to Lowest
+            elif current_state == 1:
+                row_data.sort(key=lambda x: x["personal_rating"], reverse=False)  # Lowest to Highest
 
         # Cycle to the next state
         sort_states[column] = (current_state + 1) % 2
@@ -2266,10 +2312,15 @@ class MovieApp(QWidget):
             cast_item.setTextAlignment(Qt.AlignCenter)
             table.setItem(row_idx, 3, cast_item)
 
-            # Rating
-            rating_item = QTableWidgetItem(f"{row['rating']:.1f}" if row['rating'] else "N/A")
+            # IMDb Rating
+            rating_item = QTableWidgetItem(f"{row['imdb rating']:.1f}" if row['imdb rating'] else "N/A")
             rating_item.setTextAlignment(Qt.AlignCenter)
             table.setItem(row_idx, 4, rating_item)
+
+            # Personal Rating
+            personal_rating_item = QTableWidgetItem(f"{row['personal_rating']:.1f}" if row['personal_rating'] else "")
+            personal_rating_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row_idx, 5, personal_rating_item)
 
             # Set consistent row height
             table.setRowHeight(row_idx, 138)
@@ -2736,7 +2787,7 @@ class MovieApp(QWidget):
             print(f"[DEBUG] Movies saved to file at: {file_path}")
         except Exception as e:
             print(f"[ERROR] Failed to save movies: {e}")
-    
+
     def load_saved_movies(self):
         """Load saved movies from the JSON file in the user-defined directory."""
         try:
@@ -2756,7 +2807,7 @@ class MovieApp(QWidget):
         except Exception as e:
             print(f"[ERROR] Failed to load saved movies: {e}")
             return {}
-    
+
     def get_existing_list(self, title_with_year):
         """Check if a movie or show already exists in either list."""
         match = re.match(r"(.*?)(?:\s\[(\d{4}(?:–\d{4}|–)?)\])?$", title_with_year)
